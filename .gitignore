@@ -1,0 +1,55 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Editor/IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# Logs
+*.log
+
+# Go build artifacts
+bin/
+build/
+dist/
+.out/
+*.out
+*.test
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Coverage
+coverage/
+*.coverprofile
+
+# Go modules (vendored)
+vendor/
+
+# Node (if present)
+node_modules/
+
+# Docker/Env (opt-in to commit if needed)
+.env
+
+# Helm packaged charts
+**/*.tgz
+
+# Kubernetes local config
+.kube/
+
+# Compiled binaries present in this repo (no extensions)
+# Root-level Go binaries built from this workspace
+/kwok
+/kwokctl
+/scale-cluster-agent
+
+# remotedialer debug binaries
+/remotedialer-debug/client/client
+/remotedialer-debug/dummy/dummy
+/remotedialer-debug/server/server
+/remotedialer-debug/proxy/server
