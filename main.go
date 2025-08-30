@@ -20,11 +20,14 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	_ "net/http/pprof"
 	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
+	pprof "runtime/pprof"
 	"strconv"
 	"strings"
 	"sync"
@@ -92,6 +95,43 @@ func main() {
 
 	// Start local ping server for stv-cluster health checks
 	agent.startLocalPingServer()
+
+	// Start optional pprof server and memory logging
+	if config.PprofEnable {
+		pprofPort := config.PprofPort
+		if pprofPort == 0 { pprofPort = 6060 }
+		go func() {
+			addr := fmt.Sprintf(":%d", pprofPort)
+			logrus.Infof("pprof enabled on %s", addr)
+			if err := http.ListenAndServe(addr, nil); err != nil && err != http.ErrServerClosed {
+				logrus.Warnf("pprof server error: %v", err)
+			}
+		}()
+		if config.MemLogIntervalSec > 0 {
+			go func() {
+				t := time.NewTicker(time.Duration(config.MemLogIntervalSec) * time.Second)
+				defer t.Stop()
+				for {
+					select {
+					case <-t.C:
+						var ms runtime.MemStats
+						runtime.ReadMemStats(&ms)
+						logrus.WithFields(logrus.Fields{
+							"alloc_mb":          float64(ms.Alloc) / (1024*1024),
+							"heap_alloc_mb":     float64(ms.HeapAlloc) / (1024*1024),
+							"heap_inuse_mb":     float64(ms.HeapInuse) / (1024*1024),
+							"heap_idle_mb":      float64(ms.HeapIdle) / (1024*1024),
+							"num_gc":            ms.NumGC,
+							"next_gc_mb":        float64(ms.NextGC) / (1024*1024),
+							"num_goroutine":     runtime.NumGoroutine(),
+						}).Info("memstats")
+					case <-ctx.Done():
+						return
+					}
+				}
+			}()
+		}
+	}
 
 	// Initialize KWOK cluster manager with absolute paths
 	kwokctlPath, err := filepath.Abs("./kwokctl")
@@ -217,10 +257,31 @@ func main() {
 		}
 	}()
 
-	// Wait for shutdown signal
+	// Wait for shutdown signal; also support SIGUSR1 to dump heap profile
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	<-sigChan
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGUSR1)
+	for {
+		s := <-sigChan
+		if s == syscall.SIGUSR1 {
+			// On demand heap dump for debugging
+			ts := time.Now().Format("20060102-150405")
+			fname := fmt.Sprintf("heap-%s.pprof", ts)
+			f, err := os.Create(fname)
+			if err != nil {
+				logrus.Errorf("failed to create heap profile: %v", err)
+				continue
+			}
+			// import runtime/pprof lazily
+			if err := pprof.Lookup("heap").WriteTo(f, 0); err != nil {
+				logrus.Errorf("failed to write heap profile: %v", err)
+			} else {
+				logrus.Infof("wrote heap profile to %s", fname)
+			}
+			_ = f.Close()
+			continue
+		}
+		break
+	}
 
 	logrus.Info("Shutting down scale cluster agent...")
 
@@ -252,40 +313,27 @@ func loadConfig() (*Config, error) {
 			// Use environment fallback
 			config.RancherURL = os.Getenv("RANCHER_URL")
 			config.BearerToken = os.Getenv("RANCHER_TOKEN")
-			portStr := os.Getenv("SCALE_AGENT_PORT")
-			if portStr != "" {
-				if p, perr := strconv.Atoi(portStr); perr == nil {
-					config.ListenPort = p
-				}
+			if portStr := os.Getenv("SCALE_AGENT_PORT"); portStr != "" {
+				if p, perr := strconv.Atoi(portStr); perr == nil { config.ListenPort = p }
 			}
 			config.LogLevel = os.Getenv("SCALE_AGENT_LOG")
 			// Multi-tenant env fallbacks (optional)
-			if v := os.Getenv("SCALE_AGENT_MULTI_TENANT"); v != "" {
-				lv := strings.ToLower(strings.TrimSpace(v))
-				config.MultiTenant = (lv == "1" || lv == "true" || lv == "yes")
-			}
-			if v := os.Getenv("SCALE_AGENT_MAIN_CLUSTER_NAME"); v != "" {
-				config.MainClusterName = v
-			}
-			if v := os.Getenv("SCALE_AGENT_MAIN_API_PORT"); v != "" {
-				if p, perr := strconv.Atoi(strings.TrimSpace(v)); perr == nil { config.MainAPIPort = p }
-			}
-			if v := os.Getenv("SCALE_AGENT_PROXY_BASE_PORT"); v != "" {
-				if p, perr := strconv.Atoi(strings.TrimSpace(v)); perr == nil { config.ProxyBasePort = p }
-			}
-			if config.RancherURL == "" {
-				config.RancherURL = "https://rancher.invalid"
-			}
-			if config.ListenPort == 0 {
-				config.ListenPort = 9090
-			}
-			if config.LogLevel == "" {
-				config.LogLevel = "debug"
-			}
+			if v := os.Getenv("SCALE_AGENT_MULTI_TENANT"); v != "" { lv := strings.ToLower(strings.TrimSpace(v)); config.MultiTenant = (lv == "1" || lv == "true" || lv == "yes") }
+			if v := os.Getenv("SCALE_AGENT_MAIN_CLUSTER_NAME"); v != "" { config.MainClusterName = v }
+			if v := os.Getenv("SCALE_AGENT_MAIN_API_PORT"); v != "" { if p, perr := strconv.Atoi(strings.TrimSpace(v)); perr == nil { config.MainAPIPort = p } }
+			if v := os.Getenv("SCALE_AGENT_PROXY_BASE_PORT"); v != "" { if p, perr := strconv.Atoi(strings.TrimSpace(v)); perr == nil { config.ProxyBasePort = p } }
+			// Diagnostics env
+			if v := os.Getenv("SCALE_AGENT_PPROF"); v != "" { lv := strings.ToLower(strings.TrimSpace(v)); config.PprofEnable = (lv == "1" || lv == "true" || lv == "yes") }
+			if v := os.Getenv("SCALE_AGENT_PPROF_PORT"); v != "" { if p, perr := strconv.Atoi(strings.TrimSpace(v)); perr == nil { config.PprofPort = p } }
+			if v := os.Getenv("SCALE_AGENT_MEM_LOG_INTERVAL"); v != "" { if p, perr := strconv.Atoi(strings.TrimSpace(v)); perr == nil { config.MemLogIntervalSec = p } }
+			if config.RancherURL == "" { config.RancherURL = "https://rancher.invalid" }
+			if config.ListenPort == 0 { config.ListenPort = 9090 }
+			if config.LogLevel == "" { config.LogLevel = "debug" }
 			// Reasonable defaults for multi-tenant knobs
 			if config.MainClusterName == "" { config.MainClusterName = "main-cluster" }
 			if config.MainAPIPort == 0 { config.MainAPIPort = 8050 }
 			if config.ProxyBasePort == 0 { config.ProxyBasePort = 8440 }
+			if config.PprofPort == 0 { config.PprofPort = 6060 }
 			logrus.Warnf("Config file %s not found; using environment/default values", configPath)
 		} else {
 			return nil, fmt.Errorf("failed to read config file %s: %v", configPath, err)
@@ -306,80 +354,67 @@ func loadConfig() (*Config, error) {
 				if v, ok := ycfg["MainClusterName"].(string); ok { config.MainClusterName = strings.TrimSpace(v) }
 				if v, ok := ycfg["MainAPIPort"].(int); ok { config.MainAPIPort = v } else if v2, ok2 := ycfg["MainAPIPort"].(float64); ok2 { config.MainAPIPort = int(v2) } else if v3, ok3 := ycfg["MainAPIPort"].(string); ok3 { if p, perr := strconv.Atoi(strings.TrimSpace(v3)); perr == nil { config.MainAPIPort = p } }
 				if v, ok := ycfg["ProxyBasePort"].(int); ok { config.ProxyBasePort = v } else if v2, ok2 := ycfg["ProxyBasePort"].(float64); ok2 { config.ProxyBasePort = int(v2) } else if v3, ok3 := ycfg["ProxyBasePort"].(string); ok3 { if p, perr := strconv.Atoi(strings.TrimSpace(v3)); perr == nil { config.ProxyBasePort = p } }
+				// Diagnostics
+				if v, ok := ycfg["PprofEnable"].(bool); ok { config.PprofEnable = v } else if v2, ok2 := ycfg["PprofEnable"].(string); ok2 { lv := strings.ToLower(strings.TrimSpace(v2)); config.PprofEnable = (lv == "1" || lv == "true" || lv == "yes") }
+				if v, ok := ycfg["PprofPort"].(int); ok { config.PprofPort = v } else if v2, ok2 := ycfg["PprofPort"].(float64); ok2 { config.PprofPort = int(v2) } else if v3, ok3 := ycfg["PprofPort"].(string); ok3 { if p, perr := strconv.Atoi(strings.TrimSpace(v3)); perr == nil { config.PprofPort = p } }
+				if v, ok := ycfg["MemLogIntervalSec"].(int); ok { config.MemLogIntervalSec = v } else if v2, ok2 := ycfg["MemLogIntervalSec"].(float64); ok2 { config.MemLogIntervalSec = int(v2) } else if v3, ok3 := ycfg["MemLogIntervalSec"].(string); ok3 { if p, perr := strconv.Atoi(strings.TrimSpace(v3)); perr == nil { config.MemLogIntervalSec = p } }
 			} else {
 				// Very naive key:value fallback
 				lines := strings.Split(string(data), "\n")
 				for _, l := range lines {
 					l = strings.TrimSpace(l)
-					if l == "" || strings.HasPrefix(l, "#") {
-						continue
-					}
+					if l == "" || strings.HasPrefix(l, "#") { continue }
 					parts := strings.SplitN(l, ":", 2)
-					if len(parts) != 2 {
-						continue
-					}
+					if len(parts) != 2 { continue }
 					k := strings.TrimSpace(parts[0])
 					v := strings.Trim(strings.TrimSpace(parts[1]), "\"'")
 					switch k {
-					case "RancherURL":
-						config.RancherURL = v
-					case "BearerToken":
-						config.BearerToken = v
-					case "ListenPort":
-						if p, err := strconv.Atoi(v); err == nil {
-							config.ListenPort = p
-						}
-					case "LogLevel":
-						config.LogLevel = v
-					case "MultiTenant":
-						lv := strings.ToLower(v)
-						config.MultiTenant = (lv == "1" || lv == "true" || lv == "yes")
-					case "MainClusterName":
-						config.MainClusterName = v
-					case "MainAPIPort":
-						if p, err := strconv.Atoi(v); err == nil { config.MainAPIPort = p }
-					case "ProxyBasePort":
-						if p, err := strconv.Atoi(v); err == nil { config.ProxyBasePort = p }
+					case "RancherURL": config.RancherURL = v
+					case "BearerToken": config.BearerToken = v
+					case "ListenPort": if p, err := strconv.Atoi(v); err == nil { config.ListenPort = p }
+					case "LogLevel": config.LogLevel = v
+					case "MultiTenant": lv := strings.ToLower(v); config.MultiTenant = (lv == "1" || lv == "true" || lv == "yes")
+					case "MainClusterName": config.MainClusterName = v
+					case "MainAPIPort": if p, err := strconv.Atoi(v); err == nil { config.MainAPIPort = p }
+					case "ProxyBasePort": if p, err := strconv.Atoi(v); err == nil { config.ProxyBasePort = p }
+					case "PprofEnable": lv := strings.ToLower(strings.TrimSpace(v)); config.PprofEnable = (lv == "1" || lv == "true" || lv == "yes")
+					case "PprofPort": if p, err := strconv.Atoi(v); err == nil { config.PprofPort = p }
+					case "MemLogIntervalSec": if p, err := strconv.Atoi(v); err == nil { config.MemLogIntervalSec = p }
 					}
 				}
 			}
 		}
 	}
 
+	// Apply environment overrides regardless of source (file or fallback)
+	if v := os.Getenv("SCALE_AGENT_LOG"); v != "" { config.LogLevel = v }
+	if v := os.Getenv("SCALE_AGENT_PPROF"); v != "" { lv := strings.ToLower(strings.TrimSpace(v)); config.PprofEnable = (lv == "1" || lv == "true" || lv == "yes") }
+	if v := os.Getenv("SCALE_AGENT_PPROF_PORT"); v != "" { if p, perr := strconv.Atoi(strings.TrimSpace(v)); perr == nil { config.PprofPort = p } }
+	if v := os.Getenv("SCALE_AGENT_MEM_LOG_INTERVAL"); v != "" { if p, perr := strconv.Atoi(strings.TrimSpace(v)); perr == nil { config.MemLogIntervalSec = p } }
+
 	// Normalize/trim
 	config.RancherURL = strings.TrimSpace(config.RancherURL)
 	config.BearerToken = strings.TrimSpace(config.BearerToken)
 	// If user pasted a full header value, strip leading 'Bearer '
-	if strings.HasPrefix(strings.ToLower(config.BearerToken), "bearer ") {
-		config.BearerToken = strings.TrimSpace(config.BearerToken[7:])
-	}
+	if strings.HasPrefix(strings.ToLower(config.BearerToken), "bearer ") { config.BearerToken = strings.TrimSpace(config.BearerToken[7:]) }
 	config.LogLevel = strings.TrimSpace(config.LogLevel)
 
 	// Validate required fields
-	if config.RancherURL == "" {
-		return nil, fmt.Errorf("RancherURL is required in config file %s", configPath)
-	}
-	if config.BearerToken == "" {
-		return nil, fmt.Errorf("BearerToken is required in config file %s", configPath)
-	}
+	if config.RancherURL == "" { return nil, fmt.Errorf("RancherURL is required in config file %s", configPath) }
+	if config.BearerToken == "" { return nil, fmt.Errorf("BearerToken is required in config file %s", configPath) }
 
 	// Set defaults
-	if config.ListenPort == 0 {
-		config.ListenPort = 9090
-	}
-	if config.LogLevel == "" {
-		config.LogLevel = "info"
-	}
+	if config.ListenPort == 0 { config.ListenPort = 9090 }
+	if config.LogLevel == "" { config.LogLevel = "info" }
 	if config.MainClusterName == "" { config.MainClusterName = "main-cluster" }
 	if config.MainAPIPort == 0 { config.MainAPIPort = 8050 }
 	if config.ProxyBasePort == 0 { config.ProxyBasePort = 8440 }
+	if config.PprofPort == 0 { config.PprofPort = 6060 }
 
-	logrus.Infof("Using config: RancherURL=%s ListenPort=%d LogLevel=%s MultiTenant=%v MainClusterName=%s MainAPIPort=%d ProxyBasePort=%d",
-		config.RancherURL, config.ListenPort, config.LogLevel, config.MultiTenant, config.MainClusterName, config.MainAPIPort, config.ProxyBasePort)
+	logrus.Infof("Using config: RancherURL=%s ListenPort=%d LogLevel=%s MultiTenant=%v MainClusterName=%s MainAPIPort=%d ProxyBasePort=%d PprofEnable=%v PprofPort=%d MemLogIntervalSec=%d",
+		config.RancherURL, config.ListenPort, config.LogLevel, config.MultiTenant, config.MainClusterName, config.MainAPIPort, config.ProxyBasePort, config.PprofEnable, config.PprofPort, config.MemLogIntervalSec)
 	// Log a safe token identifier (prefix before ':') for debugging
-	if idx := strings.Index(config.BearerToken, ":"); idx > 0 {
-		logrus.Infof("Using Rancher token ID: %s (secret masked)", config.BearerToken[:idx])
-	}
+	if idx := strings.Index(config.BearerToken, ":"); idx > 0 { logrus.Infof("Using Rancher token ID: %s (secret masked)", config.BearerToken[:idx]) }
 	return &config, nil
 }
 
@@ -1138,99 +1173,16 @@ func (a *ScaleAgent) connectClusterToRancher(clusterName, clusterID string, clus
 		}
 	}
 
-	// Extract the registration token from Rancher
-	// We need to use the valid token for the WebSocket connection and cluster params
-	rancherToken, err := a.getClusterToken(clusterID)
-	if err != nil {
-		logrus.Errorf("Failed to get cluster token for Rancher connection: %v", err)
-		// Mark connection as failed
-		a.connMutex.Lock()
-		delete(a.activeConnections, clusterName)
-		a.connMutex.Unlock()
-		return
-	}
-
-	logrus.Infof("Using valid token for both Rancher server connection and cluster params")
-
-	// Now use the extracted credentials for WebSocket connection (like real agent)
-	// Use the Rancher server URL host, not the cluster ID
+	// Parse Rancher URL once and compute WS endpoint
 	rancherURL, err := url.Parse(a.config.RancherURL)
 	if err != nil {
 		logrus.Errorf("Failed to parse Rancher URL: %v", err)
-		// Mark connection as failed
 		a.connMutex.Lock()
 		delete(a.activeConnections, clusterName)
 		a.connMutex.Unlock()
 		return
 	}
-	wsURL := fmt.Sprintf("wss://%s/v3/connect/register", rancherURL.Host) // Use /register endpoint like real agent
-
-	logrus.Infof("Attempting WebSocket connection to %s for cluster %s", wsURL, clusterName)
-
-	// Get cluster parameters using the real agent's approach
-	clusterParams, err := a.getClusterParams(clusterID)
-	if err != nil {
-		logrus.Errorf("Failed to get cluster parameters: %v", err)
-		// Mark connection as failed
-		a.connMutex.Lock()
-		delete(a.activeConnections, clusterName)
-		a.connMutex.Unlock()
-		return
-	}
-
-	params := clusterParams
-	payload, err := json.Marshal(params)
-	if err != nil {
-		logrus.Errorf("marshal params: %v", err)
-		// Mark connection as failed
-		a.connMutex.Lock()
-		delete(a.activeConnections, clusterName)
-		a.connMutex.Unlock()
-		return
-	}
-	encodedParams := base64.StdEncoding.EncodeToString(payload)
-	logrus.Infof("Prepared tunnel params for %s: %s", clusterName, string(payload))
-
-	// Extract the local API address from clusterParams for the allowFunc
-	clusterData, ok := clusterParams["cluster"].(map[string]interface{})
-	if !ok {
-		logrus.Errorf("Failed to extract cluster data from params")
-		// Mark connection as failed
-		a.connMutex.Lock()
-		delete(a.activeConnections, clusterName)
-		a.connMutex.Unlock()
-		return
-	}
-	localAPI, ok := clusterData["address"].(string)
-	if !ok {
-		logrus.Errorf("Failed to extract address from cluster data")
-		// Mark connection as failed
-		a.connMutex.Lock()
-		delete(a.activeConnections, clusterName)
-		a.connMutex.Unlock()
-		return
-	}
-
-	headers := http.Header{}
-	headers.Set("X-API-Tunnel-Token", rancherToken) // Valid token for WebSocket connection to Rancher
-	headers.Set("X-API-Tunnel-Params", encodedParams)
-
-	allowFunc := func(proto, address string) bool {
-		if proto != "tcp" {
-			return false
-		}
-		// Allow KWOK API target (normal proxied traffic)
-		if address == localAPI {
-			return true
-		}
-		// Allow Rancher server's connectivity probe used by ClusterConnected controller:
-		// it performs client.Get("http://not-used/ping"), which dials host "not-used" on port 80 via the tunnel.
-		if address == "not-used:80" {
-			return true
-		}
-		logrus.Tracef("REMOTEDIALER allowFunc: denying dial to %s (proto=%s)", address, proto)
-		return false
-	}
+	wsURL := fmt.Sprintf("wss://%s/v3/connect/register", rancherURL.Host)
 
 	// Track connection attempts and success
 	connectionAttempts := 0
@@ -1254,37 +1206,97 @@ func (a *ScaleAgent) connectClusterToRancher(clusterName, clusterID string, clus
 		return nil
 	}
 
-	logrus.Infof("Connecting with KWOK cluster address %s", localAPI)
+	// Refresh interval to proactively rotate TokenRequest-derived tokens (default K8s is ~1h)
+	const refreshInterval = 50 * time.Minute
+
 	go func() {
 		backoff := time.Second
 		for {
-			ctx, cancel := context.WithCancel(a.ctx)
-
-			// Check if we've exceeded max attempts
-			if connectionAttempts >= maxAttempts {
-				logrus.Errorf("❌ Cluster %s failed to connect after %d attempts, marking as failed", clusterName, maxAttempts)
+			// Always resolve fresh params before each connect to pick up a new SA token
+			rancherToken, err := a.getClusterToken(clusterID)
+			if err != nil {
+				logrus.Errorf("Failed to get cluster token for Rancher connection: %v", err)
 				a.connMutex.Lock()
 				delete(a.activeConnections, clusterName)
 				a.connMutex.Unlock()
 				return
 			}
+
+			clusterParams, err := a.getClusterParams(clusterID)
+			if err != nil {
+				logrus.Errorf("Failed to get cluster parameters: %v", err)
+				a.connMutex.Lock()
+				delete(a.activeConnections, clusterName)
+				a.connMutex.Unlock()
+				return
+			}
+			payload, err := json.Marshal(clusterParams)
+			if err != nil {
+				logrus.Errorf("marshal params: %v", err)
+				a.connMutex.Lock()
+				delete(a.activeConnections, clusterName)
+				a.connMutex.Unlock()
+				return
+			}
+			encodedParams := base64.StdEncoding.EncodeToString(payload)
+
+			// Extract local API for allowFunc each time (it can differ in MT vs ST)
+			clusterData, ok := clusterParams["cluster"].(map[string]interface{})
+			if !ok {
+				logrus.Errorf("Failed to extract cluster data from params")
+				a.connMutex.Lock()
+				delete(a.activeConnections, clusterName)
+				a.connMutex.Unlock()
+				return
+			}
+			localAPI, ok := clusterData["address"].(string)
+			if !ok {
+				logrus.Errorf("Failed to extract address from cluster data")
+				a.connMutex.Lock()
+				delete(a.activeConnections, clusterName)
+				a.connMutex.Unlock()
+				return
+			}
+
+			headers := http.Header{}
+			headers.Set("X-API-Tunnel-Token", rancherToken)
+			headers.Set("X-API-Tunnel-Params", encodedParams)
+
+			allowFunc := func(proto, address string) bool {
+				if proto != "tcp" {
+					return false
+				}
+				if address == localAPI {
+					return true
+				}
+				if address == "not-used:80" {
+					return true
+				}
+				logrus.Tracef("REMOTEDIALER allowFunc: denying dial to %s (proto=%s)", address, proto)
+				return false
+			}
+
+			logrus.Infof("Attempting WebSocket connection to %s for cluster %s (proxying %s)", wsURL, clusterName, localAPI)
+
+			// Context with timeout so we proactively rotate params before TokenRequest expiry
+			ctx, cancel := context.WithTimeout(a.ctx, refreshInterval)
 
 			// Connect to Rancher using remotedialer
 			err = remotedialer.ClientConnect(ctx, wsURL, headers, nil, allowFunc, onConnect)
+			cancel()
 			if err != nil {
 				logrus.Errorf("Failed to connect to proxy: %v", err)
-				// Mark connection as failed
 				a.connMutex.Lock()
 				delete(a.activeConnections, clusterName)
 				a.connMutex.Unlock()
 				return
 			}
-			cancel()
 
 			if a.ctx.Err() != nil {
 				return
 			}
 
+			// Exponential backoff between reconnect loops
 			if backoff < 30*time.Second {
 				backoff *= 2
 			}

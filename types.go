@@ -23,6 +23,11 @@ type Config struct {
     MainClusterName string `json:"MainClusterName"`
     MainAPIPort     int    `json:"MainAPIPort"`   // secure or insecure port exposed by KWOK apiserver
     ProxyBasePort   int    `json:"ProxyBasePort"` // starting port for per-virtual-cluster proxies
+
+    // Diagnostics/profiling
+    PprofEnable        bool `json:"PprofEnable"`
+    PprofPort          int  `json:"PprofPort"`
+    MemLogIntervalSec  int  `json:"MemLogIntervalSec"` // if >0, periodically logs mem stats
 }
 
 // ScaleAgent is the main application state container.
@@ -204,7 +209,44 @@ func (a *ScaleAgent) SaveState() error {
     if err != nil {
         return fmt.Errorf("failed to marshal state: %w", err)
     }
-    return os.WriteFile(path, data, 0o644)
+    dir := filepath.Dir(path)
+    // Write atomically: write to temp file, fsync, then rename over
+    tmp, err := os.CreateTemp(dir, "state-*.json.tmp")
+    if err != nil {
+        return fmt.Errorf("failed to create temp state file: %w", err)
+    }
+    tmpName := tmp.Name()
+    // Ensure temp file is removed on failure paths
+    defer func() { _ = os.Remove(tmpName) }()
+
+    if _, err := tmp.Write(data); err != nil {
+        _ = tmp.Close()
+        return fmt.Errorf("failed to write temp state file: %w", err)
+    }
+    if err := tmp.Sync(); err != nil {
+        _ = tmp.Close()
+        return fmt.Errorf("failed to sync temp state file: %w", err)
+    }
+    if err := tmp.Close(); err != nil {
+        return fmt.Errorf("failed to close temp state file: %w", err)
+    }
+
+    // Best-effort backup of current state before replacing
+    if _, statErr := os.Stat(path); statErr == nil {
+        if b, rErr := os.ReadFile(path); rErr == nil && len(b) > 0 {
+            _ = os.WriteFile(path+".bak", b, 0o644)
+        }
+    }
+
+    if err := os.Rename(tmpName, path); err != nil {
+        return fmt.Errorf("failed to replace state file: %w", err)
+    }
+    // fsync directory to persist rename on crash-prone systems (best-effort)
+    if d, derr := os.Open(dir); derr == nil {
+        _ = d.Sync()
+        _ = d.Close()
+    }
+    return nil
 }
 
 // LoadState attempts to restore minimal agent state from disk.
@@ -227,13 +269,24 @@ func (a *ScaleAgent) LoadState() error {
         }
         return fmt.Errorf("failed to read state: %w", err)
     }
+    // If file is empty or corrupt, try backup
+    use := b
     var payload struct {
         Clusters   map[string]*ClusterInfo `json:"clusters"`
         ProxyPorts map[string]int          `json:"proxyPorts,omitempty"`
         Version    string                  `json:"version"`
     }
-    if err := json.Unmarshal(b, &payload); err != nil {
-        return fmt.Errorf("failed to unmarshal state: %w", err)
+    if len(use) == 0 || json.Unmarshal(use, &payload) != nil {
+        if bb, berr := os.ReadFile(path+".bak"); berr == nil && len(bb) > 0 {
+            if uerr := json.Unmarshal(bb, &payload); uerr == nil {
+                // Restore from backup
+                use = bb
+            } else {
+                return fmt.Errorf("failed to unmarshal state and backup: %v / %v", json.Unmarshal(use, &payload), uerr)
+            }
+        } else {
+            return fmt.Errorf("failed to unmarshal state: %w", json.Unmarshal(use, &payload))
+        }
     }
     if payload.Clusters == nil {
         payload.Clusters = make(map[string]*ClusterInfo)
