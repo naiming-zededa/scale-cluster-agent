@@ -133,6 +133,25 @@ func main() {
 		}
 	}
 
+	// Setup HTTP server early so we don't block listening on 9090 during KWOK setup
+	router := mux.NewRouter()
+	router.HandleFunc("/health", agent.healthHandler).Methods("GET")
+	router.HandleFunc("/clusters", agent.createClusterHandler).Methods("POST")
+	router.HandleFunc("/clusters", agent.listClustersHandler).Methods("GET")
+	router.HandleFunc("/clusters/{name}", agent.deleteClusterHandler).Methods("DELETE")
+
+	agent.httpServer = &http.Server{
+		Addr:    fmt.Sprintf(":%d", config.ListenPort),
+		Handler: router,
+	}
+
+	go func() {
+		logrus.Infof("Starting HTTP server on port %d", config.ListenPort)
+		if err := agent.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logrus.Fatalf("HTTP server error: %v", err)
+		}
+	}()
+
 	// Initialize KWOK cluster manager with absolute paths
 	kwokctlPath, err := filepath.Abs("./kwokctl")
 	if err != nil {
@@ -146,7 +165,7 @@ func main() {
 	logrus.Infof("Using kwokctl path: %s", kwokctlPath)
 	logrus.Infof("Using kwok path: %s", kwokPath)
 
-	agent.kwokManager = NewKWOKClusterManager(kwokctlPath, kwokPath, 8001)
+	agent.kwokManager = NewKWOKClusterManager(kwokctlPath, kwokPath, 8001, config.Audit)
 	// Rebuild KWOK cluster mappings from disk so restarts can reconnect without a POST
 	agent.kwokManager.RehydrateFromDisk()
 	// If multi-tenant mode, ensure the main KWOK cluster is present
@@ -206,25 +225,6 @@ func main() {
 		}
 	}
 
-	// Setup HTTP server
-	router := mux.NewRouter()
-	router.HandleFunc("/health", agent.healthHandler).Methods("GET")
-	router.HandleFunc("/clusters", agent.createClusterHandler).Methods("POST")
-	router.HandleFunc("/clusters", agent.listClustersHandler).Methods("GET")
-	router.HandleFunc("/clusters/{name}", agent.deleteClusterHandler).Methods("DELETE")
-
-	agent.httpServer = &http.Server{
-		Addr:    fmt.Sprintf(":%d", config.ListenPort),
-		Handler: router,
-	}
-
-	// Start HTTP server
-	go func() {
-		logrus.Infof("Starting HTTP server on port %d", config.ListenPort)
-		if err := agent.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logrus.Fatalf("HTTP server error: %v", err)
-		}
-	}()
 
 	// Start websocket connection to Rancher only when we have clusters
 	go agent.startWebSocketConnection()
@@ -307,6 +307,7 @@ func loadConfig() (*Config, error) {
 	configPath := filepath.Join(homeDir, ".scale-cluster-agent", "config", "config")
 
 	var config Config
+	fileFound := false
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -339,6 +340,7 @@ func loadConfig() (*Config, error) {
 			return nil, fmt.Errorf("failed to read config file %s: %v", configPath, err)
 		}
 	} else {
+	fileFound = true
 		// Try JSON first
 		if err := json.Unmarshal(data, &config); err != nil {
 			// Try YAML next
@@ -356,8 +358,12 @@ func loadConfig() (*Config, error) {
 				if v, ok := ycfg["ProxyBasePort"].(int); ok { config.ProxyBasePort = v } else if v2, ok2 := ycfg["ProxyBasePort"].(float64); ok2 { config.ProxyBasePort = int(v2) } else if v3, ok3 := ycfg["ProxyBasePort"].(string); ok3 { if p, perr := strconv.Atoi(strings.TrimSpace(v3)); perr == nil { config.ProxyBasePort = p } }
 				// Diagnostics
 				if v, ok := ycfg["PprofEnable"].(bool); ok { config.PprofEnable = v } else if v2, ok2 := ycfg["PprofEnable"].(string); ok2 { lv := strings.ToLower(strings.TrimSpace(v2)); config.PprofEnable = (lv == "1" || lv == "true" || lv == "yes") }
+				// Support alias 'Pprof' in YAML
+				if v, ok := ycfg["Pprof"].(bool); ok { config.PprofEnable = v } else if v2, ok2 := ycfg["Pprof"].(string); ok2 { lv := strings.ToLower(strings.TrimSpace(v2)); config.PprofEnable = (lv == "1" || lv == "true" || lv == "yes") }
 				if v, ok := ycfg["PprofPort"].(int); ok { config.PprofPort = v } else if v2, ok2 := ycfg["PprofPort"].(float64); ok2 { config.PprofPort = int(v2) } else if v3, ok3 := ycfg["PprofPort"].(string); ok3 { if p, perr := strconv.Atoi(strings.TrimSpace(v3)); perr == nil { config.PprofPort = p } }
 				if v, ok := ycfg["MemLogIntervalSec"].(int); ok { config.MemLogIntervalSec = v } else if v2, ok2 := ycfg["MemLogIntervalSec"].(float64); ok2 { config.MemLogIntervalSec = int(v2) } else if v3, ok3 := ycfg["MemLogIntervalSec"].(string); ok3 { if p, perr := strconv.Atoi(strings.TrimSpace(v3)); perr == nil { config.MemLogIntervalSec = p } }
+				// Audit
+				if v, ok := ycfg["Audit"].(bool); ok { config.Audit = v } else if v2, ok2 := ycfg["Audit"].(string); ok2 { lv := strings.ToLower(strings.TrimSpace(v2)); config.Audit = (lv == "1" || lv == "true" || lv == "yes") }
 			} else {
 				// Very naive key:value fallback
 				lines := strings.Split(string(data), "\n")
@@ -378,8 +384,10 @@ func loadConfig() (*Config, error) {
 					case "MainAPIPort": if p, err := strconv.Atoi(v); err == nil { config.MainAPIPort = p }
 					case "ProxyBasePort": if p, err := strconv.Atoi(v); err == nil { config.ProxyBasePort = p }
 					case "PprofEnable": lv := strings.ToLower(strings.TrimSpace(v)); config.PprofEnable = (lv == "1" || lv == "true" || lv == "yes")
+					case "Pprof": lv := strings.ToLower(strings.TrimSpace(v)); config.PprofEnable = (lv == "1" || lv == "true" || lv == "yes")
 					case "PprofPort": if p, err := strconv.Atoi(v); err == nil { config.PprofPort = p }
 					case "MemLogIntervalSec": if p, err := strconv.Atoi(v); err == nil { config.MemLogIntervalSec = p }
+					case "Audit": lv := strings.ToLower(strings.TrimSpace(v)); config.Audit = (lv == "1" || lv == "true" || lv == "yes")
 					}
 				}
 			}
@@ -388,9 +396,13 @@ func loadConfig() (*Config, error) {
 
 	// Apply environment overrides regardless of source (file or fallback)
 	if v := os.Getenv("SCALE_AGENT_LOG"); v != "" { config.LogLevel = v }
-	if v := os.Getenv("SCALE_AGENT_PPROF"); v != "" { lv := strings.ToLower(strings.TrimSpace(v)); config.PprofEnable = (lv == "1" || lv == "true" || lv == "yes") }
+	// Only allow env to control PPROF when there's no config file present
+	if !fileFound {
+		if v := os.Getenv("SCALE_AGENT_PPROF"); v != "" { lv := strings.ToLower(strings.TrimSpace(v)); config.PprofEnable = (lv == "1" || lv == "true" || lv == "yes") }
+	}
 	if v := os.Getenv("SCALE_AGENT_PPROF_PORT"); v != "" { if p, perr := strconv.Atoi(strings.TrimSpace(v)); perr == nil { config.PprofPort = p } }
 	if v := os.Getenv("SCALE_AGENT_MEM_LOG_INTERVAL"); v != "" { if p, perr := strconv.Atoi(strings.TrimSpace(v)); perr == nil { config.MemLogIntervalSec = p } }
+	if v := os.Getenv("SCALE_AGENT_AUDIT"); v != "" { lv := strings.ToLower(strings.TrimSpace(v)); config.Audit = (lv == "1" || lv == "true" || lv == "yes") }
 
 	// Normalize/trim
 	config.RancherURL = strings.TrimSpace(config.RancherURL)
@@ -411,8 +423,8 @@ func loadConfig() (*Config, error) {
 	if config.ProxyBasePort == 0 { config.ProxyBasePort = 8440 }
 	if config.PprofPort == 0 { config.PprofPort = 6060 }
 
-	logrus.Infof("Using config: RancherURL=%s ListenPort=%d LogLevel=%s MultiTenant=%v MainClusterName=%s MainAPIPort=%d ProxyBasePort=%d PprofEnable=%v PprofPort=%d MemLogIntervalSec=%d",
-		config.RancherURL, config.ListenPort, config.LogLevel, config.MultiTenant, config.MainClusterName, config.MainAPIPort, config.ProxyBasePort, config.PprofEnable, config.PprofPort, config.MemLogIntervalSec)
+	logrus.Infof("Using config: RancherURL=%s ListenPort=%d LogLevel=%s MultiTenant=%v MainClusterName=%s MainAPIPort=%d ProxyBasePort=%d PprofEnable=%v PprofPort=%d MemLogIntervalSec=%d Audit=%v",
+		config.RancherURL, config.ListenPort, config.LogLevel, config.MultiTenant, config.MainClusterName, config.MainAPIPort, config.ProxyBasePort, config.PprofEnable, config.PprofPort, config.MemLogIntervalSec, config.Audit)
 	// Log a safe token identifier (prefix before ':') for debugging
 	if idx := strings.Index(config.BearerToken, ":"); idx > 0 { logrus.Infof("Using Rancher token ID: %s (secret masked)", config.BearerToken[:idx]) }
 	return &config, nil

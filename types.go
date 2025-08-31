@@ -28,6 +28,9 @@ type Config struct {
     PprofEnable        bool `json:"PprofEnable"`
     PprofPort          int  `json:"PprofPort"`
     MemLogIntervalSec  int  `json:"MemLogIntervalSec"` // if >0, periodically logs mem stats
+
+    // KWOK apiserver audit enablement
+    Audit bool `json:"Audit"`
 }
 
 // ScaleAgent is the main application state container.

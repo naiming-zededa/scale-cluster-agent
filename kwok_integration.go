@@ -26,6 +26,7 @@ type KWOKClusterManager struct {
 	basePort     int
 	kwokctlPath  string
 	kwokPath     string
+	auditEnabled bool
 }
 
 // KWOKCluster represents a single kwok-managed cluster
@@ -76,12 +77,13 @@ type Pod struct {
 }
 
 // NewKWOKClusterManager creates a new KWOK cluster manager
-func NewKWOKClusterManager(kwokctlPath, kwokPath string, basePort int) *KWOKClusterManager {
+func NewKWOKClusterManager(kwokctlPath, kwokPath string, basePort int, auditEnabled bool) *KWOKClusterManager {
 	return &KWOKClusterManager{
 		clusters:    make(map[string]*KWOKCluster),
 		basePort:    basePort,
 		kwokctlPath: kwokctlPath,
 		kwokPath:    kwokPath,
+	auditEnabled: auditEnabled,
 	}
 }
 
@@ -119,15 +121,49 @@ func (km *KWOKClusterManager) EnsureMainCluster(name string, apiPort int) (strin
 
 	// Create main cluster with a secure HTTPS apiserver bound to apiPort
 	// Note: we still use runtime=binary and point to kwok controller binary
-	cmd := exec.Command(km.kwokctlPath, "create", "cluster",
+	createCtx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	baseArgs := []string{
+		"create", "cluster",
 		"--name", name,
 		"--kube-apiserver-port", strconv.Itoa(apiPort),
 		"--runtime", "binary",
 		"--kwok-controller-binary", km.kwokPath,
-	)
+	}
+	args := append([]string{}, baseArgs...)
+
+	// If audit is enabled in config and an audit policy file exists at ~/.scale-cluster-agent/config/audit-policy.yaml,
+	// enable apiserver audit policy via kwokctl.
+	if km.auditEnabled {
+		home, herr := os.UserHomeDir()
+		if herr == nil {
+		policyPath := filepath.Join(home, ".scale-cluster-agent", "config", "audit-policy.yaml")
+		if st, err := os.Stat(policyPath); err == nil && !st.IsDir() {
+			logDir := filepath.Join(home, ".scale-cluster-agent", "logs", "audit")
+			if mkErr := os.MkdirAll(logDir, 0o755); mkErr != nil {
+				logrus.Warnf("Failed to create audit log dir %s: %v", logDir, mkErr)
+			}
+				// Use kwokctl native audit flag
+				args = append(args, "--kube-audit-policy", policyPath)
+				logrus.Infof("Main KWOK cluster %s: enabling apiserver audit policy=%s", name, policyPath)
+		} else {
+				logrus.Debugf("Audit enabled but policy not found at %s; skipping apiserver audit for main cluster %s", policyPath, name)
+		}
+		} else {
+			logrus.Warnf("Audit enabled but failed to resolve home dir: %v", herr)
+		}
+	} else {
+		logrus.Debug("Audit not enabled in config; skipping apiserver audit")
+	}
+	cmd := exec.CommandContext(createCtx, km.kwokctlPath, args...)
+	logrus.Debugf("kwokctl args: %v", cmd.Args)
 	// Lower memory usage for spawned Go binaries
 	cmd.Env = append(os.Environ(), "GOMEMLIMIT=100MiB", "GOGC=25")
 	if out, err := cmd.CombinedOutput(); err != nil {
+		// If we timed out, provide a clearer error
+		if errors.Is(err, context.DeadlineExceeded) || createCtx.Err() == context.DeadlineExceeded {
+			return "", fmt.Errorf("kwokctl create cluster timed out after 3m. Output: %s", string(out))
+		}
 		return "", fmt.Errorf("failed to create main KWOK cluster: %v, out=%s", err, string(out))
 	}
 	if err := km.waitForClusterReady(name); err != nil {

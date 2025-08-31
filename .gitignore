@@ -53,3 +53,6 @@ node_modules/
 /remotedialer-debug/dummy/dummy
 /remotedialer-debug/server/server
 /remotedialer-debug/proxy/server
+
+# Local debug outputs
+debug-yaml/
