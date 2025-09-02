@@ -48,7 +48,8 @@ func main() {
 	logrus.SetFormatter(&logrus.TextFormatter{
 		FullTimestamp: true,
 	})
-	logrus.SetLevel(logrus.DebugLevel)
+	// Default to Info until config overrides it
+	logrus.SetLevel(logrus.InfoLevel)
 
 	logrus.Infof("Scale Cluster Agent version %s starting", version)
 
@@ -63,6 +64,7 @@ func main() {
 		level, err := logrus.ParseLevel(config.LogLevel)
 		if err == nil {
 			logrus.SetLevel(level)
+			logrus.Infof("Log level set to %s (from config)", logrus.GetLevel().String())
 		}
 	}
 
@@ -91,6 +93,7 @@ func main() {
 		proxyPorts:        make(map[string]int),
 		proxyCmds:         make(map[string]*exec.Cmd),
 		nextProxyPort:     0, // will be set after config load
+		reservedProxyPorts: make(map[int]bool),
 	}
 
 	// Start local ping server for stv-cluster health checks
@@ -222,6 +225,16 @@ func main() {
 					}
 				}(ci.Name, ci.ClusterID)
 			}
+		}
+	}
+
+	// Resume setup for any clusters that weren't ready yet (e.g., after a restart)
+	for name, ci := range agent.clusters {
+		if name == "template" { continue }
+		if ci.ClusterID == "" { continue }
+		if ci.Status == "" || (ci.Status != "ready" && ci.Status != "failed") {
+			logrus.Infof("Resuming setup for cluster %s (status=%s)", name, ci.Status)
+			go agent.runCompleteClusterSetup(ci)
 		}
 	}
 
@@ -504,6 +517,39 @@ func (a *ScaleAgent) isPortFree(port int) bool {
 	return true
 }
 
+// reserveProxyPort attempts to reserve a port for proxy allocation. Returns true if reserved.
+func (a *ScaleAgent) reserveProxyPort(port int) bool {
+	a.portAllocMu.Lock()
+	defer a.portAllocMu.Unlock()
+	if a.reservedProxyPorts == nil {
+		a.reservedProxyPorts = make(map[int]bool)
+	}
+	if a.reservedProxyPorts[port] {
+		return false
+	}
+	a.reservedProxyPorts[port] = true
+	return true
+}
+
+// releaseProxyPort releases a previously reserved port.
+func (a *ScaleAgent) releaseProxyPort(port int) {
+	a.portAllocMu.Lock()
+	delete(a.reservedProxyPorts, port)
+	a.portAllocMu.Unlock()
+}
+
+// nextReservablePort finds the next free and unreserved port, reserves it, and returns it.
+func (a *ScaleAgent) nextReservablePort(start int) (int, error) {
+	p := start
+	for i := 0; i < 2000; i++ {
+		if a.isPortFree(p) && a.reserveProxyPort(p) {
+			return p, nil
+		}
+		p++
+	}
+	return 0, fmt.Errorf("no reservable free port starting from %d", start)
+}
+
 // startProxyForCluster starts a kubectl proxy bound to a local port for the given logical cluster namespace.
 func (a *ScaleAgent) startProxyForCluster(clusterID, clusterName string, desiredPort int) error {
 	if !a.config.MultiTenant { return nil }
@@ -513,23 +559,21 @@ func (a *ScaleAgent) startProxyForCluster(clusterID, clusterName string, desired
 	}
 	// Ensure namespace exists
 	if err := a.ensureNamespaceOnMain(clusterName); err != nil { return err }
-	// Decide initial candidate port
+	// Decide initial candidate port with reservation to avoid races
 	port := desiredPort
-	if port == 0 {
-		fp, err := a.findFreePort(a.nextProxyPort)
-		if err != nil { return err }
-		port = fp
-		a.nextProxyPort = port + 1
-	} else {
-		// If we were given a saved port, ensure it's actually free; otherwise pick a new free port.
-		if !a.isPortFree(port) {
-			logrus.Warnf("Saved proxy port %d is busy; selecting a free port instead", port)
-			fp, err := a.findFreePort(a.nextProxyPort)
+	if port > 0 {
+		if !a.isPortFree(port) || !a.reserveProxyPort(port) {
+			logrus.Warnf("Requested proxy port %d unavailable; selecting a new port", port)
+			var err error
+			port, err = a.nextReservablePort(a.nextProxyPort)
 			if err != nil { return err }
-			port = fp
-			a.nextProxyPort = port + 1
 		}
+	} else {
+		var err error
+		port, err = a.nextReservablePort(a.nextProxyPort)
+		if err != nil { return err }
 	}
+	a.nextProxyPort = port + 1
 	// Build a kubeconfig context that defaults to the namespace
 	kubeconfig := filepath.Join(os.Getenv("HOME"), ".kwok", "clusters", a.config.MainClusterName, "kubeconfig.yaml")
 	// Create a derived kubeconfig at temp path with namespace override via --namespace on kubectl proxy (not supported),
@@ -547,11 +591,13 @@ func (a *ScaleAgent) startProxyForCluster(clusterID, clusterName string, desired
 	// Try to start the proxy and verify the port is listening AND owned by our process; retry if needed
 	var cmd *exec.Cmd
 	for attempt := 1; attempt <= 3; attempt++ {
+		logrus.Infof("Starting kubectl proxy for %s attempt %d on 127.0.0.1:%d", clusterName, attempt, port)
 		c, err := startProxy(port)
 		if err != nil {
 			if strings.Contains(err.Error(), "address already in use") || strings.Contains(err.Error(), "bind: address already in use") {
-				// pick another free port and retry
-				fp, ferr := a.findFreePort(a.nextProxyPort)
+				// release current reservation, pick another reservable free port and retry
+				a.releaseProxyPort(port)
+				fp, ferr := a.nextReservablePort(a.nextProxyPort)
 				if ferr != nil { return fmt.Errorf("failed to find fallback port after bind error: %w", ferr) }
 				port = fp
 				a.nextProxyPort = port + 1
@@ -560,32 +606,34 @@ func (a *ScaleAgent) startProxyForCluster(clusterID, clusterName string, desired
 			return fmt.Errorf("failed to start kubectl proxy: %w", err)
 		}
 
-		// Verify the port becomes ready quickly; if not, kill and retry on a new port
-		ready := false
-		for i := 0; i < 20; i++ { // ~2s
+		// Verify the port becomes ready and is owned by our process; if not, kill and retry on a new port
+		ownedReady := false
+		for i := 0; i < 30; i++ { // up to ~3s
 			conn, derr := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 100*time.Millisecond)
 			if derr == nil {
 				_ = conn.Close()
-				// Confirm the listener belongs to our just-started process (avoid connecting to a different service on same port)
 				if a.portOwnedByPID(port, c.Process.Pid) {
-					ready = true
+					ownedReady = true
 					break
 				}
 			}
 			time.Sleep(100 * time.Millisecond)
 		}
-		if ready {
+		if ownedReady {
 			cmd = c
 			break
 		}
-		// Not ready; stop this one and try another port
+	// Not ready; stop this one and try another port
 		_ = c.Process.Kill()
-		fp, ferr := a.findFreePort(a.nextProxyPort)
-		if ferr != nil { return fmt.Errorf("proxy not ready and failed to find new port: %w", ferr) }
-		port = fp
+		logrus.Warnf("kubectl proxy for %s did not become ready on %d; retrying on another port", clusterName, port)
+	a.releaseProxyPort(port)
+	fp, ferr := a.nextReservablePort(a.nextProxyPort)
+	if ferr != nil { return fmt.Errorf("proxy not ready and failed to find new port: %w", ferr) }
+	port = fp
 		a.nextProxyPort = port + 1
 	}
 	if cmd == nil {
+	a.releaseProxyPort(port)
 		return fmt.Errorf("failed to start kubectl proxy after retries")
 	}
 
@@ -596,6 +644,9 @@ func (a *ScaleAgent) startProxyForCluster(clusterID, clusterName string, desired
 	go func(id string, c *exec.Cmd) {
 		_ = c.Wait()
 		delete(a.proxyCmds, id)
+		if p, ok := a.proxyPorts[id]; ok {
+			a.releaseProxyPort(p)
+		}
 		delete(a.proxyPorts, id)
 		_ = a.SaveState()
 	}(clusterID, cmd)
@@ -848,7 +899,7 @@ func (a *ScaleAgent) connectToRancher() {
 		// Check if this cluster has already completed the full setup workflow
 		// We only want to connect clusters that have gone through our new 6-step process
 		if clusterInfo.Status == "ready" {
-			logrus.Debugf("Cluster %s is ready, connecting to Rancher", clusterName)
+			logrus.Infof("Cluster %s is ready, connecting to Rancher", clusterName)
 			go a.connectClusterToRancher(clusterName, clusterInfo.ClusterID, clusterInfo)
 		} else {
 			logrus.Debugf("Cluster %s not ready yet (status: %s), skipping WebSocket connection", clusterName, clusterInfo.Status)
@@ -959,6 +1010,13 @@ func (a *ScaleAgent) populateTenantFromTemplate(clusterName, clusterID string) e
 				l[fmt.Sprintf("node-role.kubernetes.io/%s", r)] = "\"true\""
 			}
 			nodeLabelsStr := formatLabels(l)
+			// Log capacity/allocatable so Rancher resource totals are traceable to cluster.yaml
+			logrus.Infof(
+				"Applying node %s: capacity(cpu=%s, memory=%s, pods=%s) allocatable(cpu=%s, memory=%s, pods=%s)",
+				nn,
+				valueOr(n.Capacity, "cpu", ""), valueOr(n.Capacity, "memory", ""), valueOr(n.Capacity, "pods", ""),
+				valueOr(n.Allocatable, "cpu", ""), valueOr(n.Allocatable, "memory", ""), valueOr(n.Allocatable, "pods", ""),
+			)
 			nodeYAML := fmt.Sprintf(`apiVersion: v1
 kind: Node
 metadata:
@@ -978,6 +1036,14 @@ metadata:
 					logrus.Warnf("Verification get node %s failed: %v, out=%s", nn, verr, string(out))
 				} else {
 					logrus.Infof("populateTenantFromTemplate: verified node created: %s", strings.TrimSpace(string(out)))
+				}
+				// Patch Node.status with capacity/allocatable so Rancher sees accurate totals
+				if len(n.Capacity) > 0 || len(n.Allocatable) > 0 {
+					if err := a.patchNodeStatus(kubeconfig, nn, n.Capacity, n.Allocatable); err != nil {
+						logrus.Warnf("patch node/%s status failed: %v", nn, err)
+					} else {
+						logrus.Infof("Patched node/%s status (capacity/allocatable)", nn)
+					}
 				}
 			}
 		}
@@ -1045,6 +1111,64 @@ func (a *ScaleAgent) extractCACertFromKubeconfig(kubeconfigContent string) ([]by
 	}
 
 	return caCert, nil
+}
+
+// patchNodeStatus updates a Node's status.capacity and status.allocatable.
+// Uses 'kubectl patch node <name> --subresource=status --type=merge -p {status: {...}}'.
+// Falls back to 'kubectl replace --raw' if subresource patch isn't supported.
+func (a *ScaleAgent) patchNodeStatus(kubeconfigPath, nodeName string, capacity, allocatable map[string]string) error {
+	// Build status payload (only include provided sections)
+	status := map[string]interface{}{}
+	if len(capacity) > 0 {
+		status["capacity"] = capacity
+	}
+	if len(allocatable) > 0 {
+		status["allocatable"] = allocatable
+	}
+	if len(status) == 0 {
+		return nil
+	}
+	payload := map[string]interface{}{"status": status}
+	b, _ := json.Marshal(payload)
+
+	// Try kubectl patch with subresource first
+	patchCmd := exec.Command("kubectl", "--kubeconfig", kubeconfigPath, "patch", "node", nodeName, "--subresource=status", "--type=merge", "-p", string(b))
+	if out, err := patchCmd.CombinedOutput(); err == nil {
+		logrus.Debugf("kubectl patch status output: %s", strings.TrimSpace(string(out)))
+		return nil
+	} else {
+		// If patch fails, attempt raw replace to status endpoint
+		// GET the full node to extract resourceVersion for status object
+		getCmd := exec.Command("kubectl", "--kubeconfig", kubeconfigPath, "get", "node", nodeName, "-o", "json")
+		full, gerr := getCmd.CombinedOutput()
+		if gerr != nil {
+			return fmt.Errorf("kubectl get node failed: %v, out=%s", gerr, string(full))
+		}
+		var nodeObj map[string]interface{}
+		if jerr := json.Unmarshal(full, &nodeObj); jerr != nil {
+			return fmt.Errorf("unmarshal node json: %v", jerr)
+		}
+		// Ensure metadata.resourceVersion is preserved when replacing status
+		var rv string
+		if md, ok := nodeObj["metadata"].(map[string]interface{}); ok {
+			if v, ok := md["resourceVersion"].(string); ok { rv = v }
+		}
+		statusObj := map[string]interface{}{"metadata": map[string]interface{}{"name": nodeName}}
+		if rv != "" {
+			statusObj["metadata"].(map[string]interface{})["resourceVersion"] = rv
+		}
+		statusObj["status"] = status
+		sb, _ := json.Marshal(statusObj)
+		rawURL := fmt.Sprintf("/api/v1/nodes/%s/status", nodeName)
+		replaceCmd := exec.Command("kubectl", "--kubeconfig", kubeconfigPath, "replace", "--raw", rawURL, "-f", "-")
+		replaceCmd.Stdin = bytes.NewReader(sb)
+		if out2, rerr := replaceCmd.CombinedOutput(); rerr == nil {
+			logrus.Debugf("kubectl replace status output: %s", strings.TrimSpace(string(out2)))
+			return nil
+		} else {
+			return fmt.Errorf("kubectl patch/replace status failed: %v (patch out: %s) (replace out: %s)", err, string(out), string(out2))
+		}
+	}
 }
 
 // extractServiceAccountTokenFromKWOKCluster extracts the service account token from the KWOK cluster
@@ -1392,101 +1516,109 @@ func (a *ScaleAgent) createClusterHandler(w http.ResponseWriter, r *http.Request
 	json.NewEncoder(w).Encode(response)
 
 	// Start the complete cluster setup process in background
-	go func(ci *ClusterInfo) {
-		time.Sleep(2 * time.Second)
-		logrus.Infof("Starting complete cluster setup for %s", ci.Name)
+	go a.runCompleteClusterSetup(clusterInfo)
+}
 
-		// Step 1: Prepare backing infra
-		// - Single-tenant: create a dedicated KWOK cluster
-		// - Multi-tenant: ensure namespace on main and start a per-cluster proxy
-		ci.Status = "creating_backing"
-		clusterInfo, exists := a.clusters[ci.Name]
-		if !exists { logrus.Errorf("cluster info not found for %s", ci.Name); ci.Status = "failed"; return }
+// runCompleteClusterSetup performs the full setup flow and can be used on create and resume-after-restart
+func (a *ScaleAgent) runCompleteClusterSetup(ci *ClusterInfo) {
+	time.Sleep(2 * time.Second)
+	logrus.Infof("Starting complete cluster setup for %s", ci.Name)
 
-		var (
-			kwokErr error
-			importYAML string
-			yamlErr error
-		)
-		doneKWOK := make(chan struct{})
-		doneYAML := make(chan struct{})
+	// Step 1: Prepare backing infra
+	ci.Status = "creating_backing"
+	_ = a.SaveState()
+	stored, exists := a.clusters[ci.Name]
+	if !exists { logrus.Errorf("cluster info not found for %s", ci.Name); ci.Status = "failed"; _ = a.SaveState(); return }
 
-		// Create backing infra
-		go func() {
-			defer close(doneKWOK)
-			if a.config.MultiTenant {
-				// Ensure namespace and start proxy
-				if err := a.ensureNamespaceOnMain(ci.Name); err != nil { kwokErr = err; return }
-				// Create a convenience kubectl context inside the main KWOK kubeconfig
-				if err := a.createTenantKubectlContext(ci.Name); err != nil { logrus.Warnf("Failed to create kubectl context for %s: %v", ci.Name, err) }
-				if err := a.startProxyForCluster(ci.ClusterID, ci.Name, 0); err != nil { kwokErr = err; return }
-			} else {
-				if _, err := a.kwokManager.CreateCluster(ci.Name, ci.ClusterID, clusterInfo); err != nil { kwokErr = err }
-			}
-		}()
+	var (
+		kwokErr error
+		importYAML string
+		yamlErr error
+	)
+	doneKWOK := make(chan struct{})
+	doneYAML := make(chan struct{})
 
-		// Fetch YAML in parallel
-		ci.Status = "getting_yaml"
-		go func() {
-			defer close(doneYAML)
-			importYAML, yamlErr = a.getImportYAML(ci.ClusterID)
-		}()
-
-		// Wait for both
-		<-doneKWOK
-		<-doneYAML
-		if kwokErr != nil {
-			logrus.Errorf("Failed to create KWOK cluster for %s: %v", ci.Name, kwokErr)
-			ci.Status = "failed"
-			return
+	// Create backing infra
+	go func() {
+		defer close(doneKWOK)
+		if a.config.MultiTenant {
+			// Ensure namespace and start proxy
+			if err := a.ensureNamespaceOnMain(ci.Name); err != nil { kwokErr = err; return }
+			if err := a.createTenantKubectlContext(ci.Name); err != nil { logrus.Warnf("Failed to create kubectl context for %s: %v", ci.Name, err) }
+			if err := a.startProxyForCluster(ci.ClusterID, ci.Name, 0); err != nil { kwokErr = err; return }
+		} else {
+			if _, err := a.kwokManager.CreateCluster(ci.Name, ci.ClusterID, stored); err != nil { kwokErr = err }
 		}
-		if yamlErr != nil {
-			logrus.Errorf("Failed to get import YAML for %s: %v", ci.Name, yamlErr)
-			ci.Status = "failed"
-			return
-		}
+	}()
+
+	// Fetch YAML in parallel
+	ci.Status = "getting_yaml"
+	_ = a.SaveState()
+	go func() {
+		defer close(doneYAML)
+		importYAML, yamlErr = a.getImportYAML(ci.ClusterID)
+	}()
+
+	// Wait for both
+	<-doneKWOK
+	<-doneYAML
+	if kwokErr != nil {
+		logrus.Errorf("Failed to create KWOK cluster for %s: %v", ci.Name, kwokErr)
+		ci.Status = "failed"
+		_ = a.SaveState()
+		return
+	}
+	if yamlErr != nil {
+		logrus.Errorf("Failed to get import YAML for %s: %v", ci.Name, yamlErr)
+		ci.Status = "failed"
+		_ = a.SaveState()
+		return
+	}
 
 	// Step 2: Apply the import YAML to the backing cluster
-		ci.Status = "applying_yaml"
+	ci.Status = "applying_yaml"
+	_ = a.SaveState()
 	if err := a.applyImportYAMLToKWOKCluster(ci.ClusterID, importYAML); err != nil {
-			logrus.Errorf("Failed to apply import YAML to KWOK cluster for %s: %v", ci.Name, err)
-			ci.Status = "failed"
-			return
-		}
-
-		// Step 2b: In multi-tenant mode, populate tenant-scoped simulated resources from template
-		if a.config.MultiTenant {
-			ci.Status = "populating_template"
-			if err := a.populateTenantFromTemplate(ci.Name, ci.ClusterID); err != nil {
-				logrus.Warnf("Template population for %s encountered issues: %v", ci.Name, err)
-			}
-		}
-
-		// Step 3: Wait for service account to be ready (fast-SA path)
-		ci.Status = "waiting_service_account"
-		if err := a.waitForServiceAccountReady(ci.ClusterID); err != nil {
-			logrus.Errorf("Failed to wait for service account ready for %s: %v", ci.Name, err)
-			ci.Status = "failed"
-			return
-		}
-
-		// Step 4: Test critical API endpoints to ensure they work
-		ci.Status = "testing_api"
-		if err := a.testCriticalAPIEndpoints(ci.ClusterID); err != nil {
-			logrus.Errorf("Failed to test critical API endpoints for %s: %v", ci.Name, err)
-			ci.Status = "failed"
-			return
-		}
-
-		// Step 5: Mark cluster as ready and establish WebSocket connection
-		ci.Status = "ready"
-		// Persist status change
+		logrus.Errorf("Failed to apply import YAML to KWOK cluster for %s: %v", ci.Name, err)
+		ci.Status = "failed"
 		_ = a.SaveState()
-		logrus.Infof("All tests passed! Service account ready and API endpoints working. Establishing WebSocket connection for cluster %s", ci.Name)
-		a.connectClusterToRancher(ci.Name, ci.ClusterID, ci)
+		return
+	}
 
-		// Keep running processes unchanged to preserve prior memory profile
-	}(clusterInfo)
+	// Step 2b: In multi-tenant mode, populate tenant-scoped simulated resources from template
+	if a.config.MultiTenant {
+		ci.Status = "populating_template"
+		_ = a.SaveState()
+		if err := a.populateTenantFromTemplate(ci.Name, ci.ClusterID); err != nil {
+			logrus.Warnf("Template population for %s encountered issues: %v", ci.Name, err)
+		}
+	}
+
+	// Step 3: Wait for service account to be ready (fast-SA path)
+	ci.Status = "waiting_service_account"
+	_ = a.SaveState()
+	if err := a.waitForServiceAccountReady(ci.ClusterID); err != nil {
+		logrus.Errorf("Failed to wait for service account ready for %s: %v", ci.Name, err)
+		ci.Status = "failed"
+		_ = a.SaveState()
+		return
+	}
+
+	// Step 4: Test critical API endpoints to ensure they work
+	ci.Status = "testing_api"
+	_ = a.SaveState()
+	if err := a.testCriticalAPIEndpoints(ci.ClusterID); err != nil {
+		logrus.Errorf("Failed to test critical API endpoints for %s: %v", ci.Name, err)
+		ci.Status = "failed"
+		_ = a.SaveState()
+		return
+	}
+
+	// Step 5: Mark cluster as ready and establish WebSocket connection
+	ci.Status = "ready"
+	_ = a.SaveState()
+	logrus.Infof("All tests passed! Service account ready and API endpoints working. Establishing WebSocket connection for cluster %s", ci.Name)
+	a.connectClusterToRancher(ci.Name, ci.ClusterID, ci)
 }
 
 func (a *ScaleAgent) listClustersHandler(w http.ResponseWriter, r *http.Request) {

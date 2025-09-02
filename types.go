@@ -67,6 +67,9 @@ type ScaleAgent struct {
     proxyPorts     map[string]int       // clusterID -> local proxy port
     proxyCmds      map[string]*exec.Cmd // clusterID -> running kubectl proxy command
     nextProxyPort  int
+    // Port allocation guard to avoid races between goroutines
+    portAllocMu        sync.Mutex
+    reservedProxyPorts map[int]bool
 
     // Synchronization
     connMutex sync.RWMutex

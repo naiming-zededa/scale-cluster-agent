@@ -21,9 +21,8 @@ func main() {
 	flag.BoolVar(&debug, "debug", true, "Debug logging")
 	flag.Parse()
 
-	if debug {
-		logrus.SetLevel(logrus.DebugLevel)
-	}
+	// honor global log level from the embedding application; don't force debug here
+	_ = logrus.StandardLogger()
 
 	headers := http.Header{
 		"X-Tunnel-ID": []string{id},

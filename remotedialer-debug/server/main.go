@@ -107,7 +107,7 @@ func main() {
 	flag.Parse()
 
 	if debug {
-		logrus.SetLevel(logrus.DebugLevel)
+		// If run standalone with -debug, enable tunnel logs. When embedded, honor global level.
 		remotedialer.PrintTunnelData = true
 	}
 

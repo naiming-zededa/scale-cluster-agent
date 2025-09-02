@@ -178,7 +178,10 @@ func (s *Session) startPings(rootCtx context.Context) {
 				if err := s.sendPing(); err != nil {
 					logrus.WithError(err).Error("Error writing ping")
 				}
-				logrus.Debug("Wrote ping")
+				// Only log pings at trace level to reduce noise at info/debug
+				if logrus.IsLevelEnabled(logrus.TraceLevel) {
+					logrus.Trace("Wrote ping")
+				}
 			}
 		}
 	}()

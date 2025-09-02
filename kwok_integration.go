@@ -153,10 +153,10 @@ func (km *KWOKClusterManager) EnsureMainCluster(name string, apiPort int) (strin
 			logrus.Warnf("Audit enabled but failed to resolve home dir: %v", herr)
 		}
 	} else {
-		logrus.Debug("Audit not enabled in config; skipping apiserver audit")
+	logrus.Info("Audit not enabled in config; skipping apiserver audit")
 	}
 	cmd := exec.CommandContext(createCtx, km.kwokctlPath, args...)
-	logrus.Debugf("kwokctl args: %v", cmd.Args)
+	logrus.Infof("kwokctl args: %v", cmd.Args)
 	// Lower memory usage for spawned Go binaries
 	cmd.Env = append(os.Environ(), "GOMEMLIMIT=100MiB", "GOGC=25")
 	if out, err := cmd.CombinedOutput(); err != nil {
@@ -204,7 +204,7 @@ func (km *KWOKClusterManager) RehydrateFromDisk() {
 	entries, err := os.ReadDir(clustersDir)
 	if err != nil {
 		// Nothing to rehydrate; not fatal
-		logrus.Debugf("RehydrateFromDisk: no clusters dir or unreadable: %v", err)
+	logrus.Infof("RehydrateFromDisk: no clusters dir or unreadable: %v", err)
 		return
 	}
 
@@ -251,7 +251,7 @@ func (km *KWOKClusterManager) RehydrateFromDisk() {
 	if added > 0 {
 		logrus.Infof("Rehydrated %d KWOK cluster(s) from disk", added)
 	} else {
-		logrus.Debug("RehydrateFromDisk: no KWOK clusters found to rehydrate")
+	logrus.Info("RehydrateFromDisk: no KWOK clusters found to rehydrate")
 	}
 }
 
@@ -809,6 +809,13 @@ func (km *KWOKClusterManager) populateClusterData(cluster *KWOKCluster, clusterN
 	// Create nodes from the config
 	logrus.Infof("Creating %d nodes for cluster %s", len(clusterConfig.Nodes), clusterName)
 	for _, node := range clusterConfig.Nodes {
+		// Log capacity/allocatable so Rancher resource totals are traceable to cluster.yaml
+		logrus.Infof(
+			"Applying node %s: capacity(cpu=%s, memory=%s, pods=%s) allocatable(cpu=%s, memory=%s, pods=%s)",
+			node.Name,
+			node.Capacity["cpu"], node.Capacity["memory"], node.Capacity["pods"],
+			node.Allocatable["cpu"], node.Allocatable["memory"], node.Allocatable["pods"],
+		)
 		if err := km.createNodeFromConfig(cluster, node); err != nil {
 			return fmt.Errorf("failed to create node %s: %v", node.Name, err)
 		}

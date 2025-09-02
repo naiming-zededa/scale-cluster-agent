@@ -91,7 +91,7 @@ func pipe(a, b net.Conn) {
 }
 
 func Start(cfg *Config, restConfig *rest.Config) error {
-	logrus.SetLevel(logrus.DebugLevel)
+	// honor global log level; don't override here
 	ctx := context.Background()
 
 	// Setting Up Default Authorizer

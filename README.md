@@ -119,6 +119,10 @@ Creating a cluster triggers:
 - KWOK data lives under `~/.kwok/clusters/<cluster-name>/` (the main cluster’s kubeconfig is used for kubectl).
 - Agent state is saved atomically to `~/.scale-cluster-agent/state.json` (with `.bak` fallback on corruption).
 
+## Node capacity shown in Rancher
+
+Rancher’s cluster totals (CPU cores, memory, and pod count) come directly from the Node objects the agent applies. Those values are sourced from `~/.scale-cluster-agent/config/cluster.yaml` under each node’s `capacity` and `allocatable` fields (cpu, memory, pods). Adjust them there to change what Rancher displays. The agent logs each node’s capacity/allocatable at creation time for traceability.
+
 ## Troubleshooting
 
 - Main cluster stuck or misconfigured: remove `~/.kwok/clusters/main-cluster` and restart the agent to recreate cleanly.
