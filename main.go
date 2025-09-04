@@ -20,6 +20,7 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	_ "net/http/pprof"
 	"net/url"
 	"os"
@@ -92,6 +93,7 @@ func main() {
 		lastCAConnectAttempt: make(map[string]time.Time),
 		proxyPorts:        make(map[string]int),
 		proxyCmds:         make(map[string]*exec.Cmd),
+		proxyServers:      make(map[string]*http.Server),
 		nextProxyPort:     0, // will be set after config load
 		reservedProxyPorts: make(map[int]bool),
 	}
@@ -553,104 +555,68 @@ func (a *ScaleAgent) nextReservablePort(start int) (int, error) {
 // startProxyForCluster starts a kubectl proxy bound to a local port for the given logical cluster namespace.
 func (a *ScaleAgent) startProxyForCluster(clusterID, clusterName string, desiredPort int) error {
 	if !a.config.MultiTenant { return nil }
-	// If already running, nothing to do
-	if _, ok := a.proxyCmds[clusterID]; ok {
-		return nil
-	}
-	// Ensure namespace exists
+	// If already running (either legacy cmd or new server) do nothing
+	if _, ok := a.proxyServers[clusterID]; ok { return nil }
+	if _, ok := a.proxyCmds[clusterID]; ok { return nil }
 	if err := a.ensureNamespaceOnMain(clusterName); err != nil { return err }
-	// Decide initial candidate port with reservation to avoid races
+
+	// Determine port
 	port := desiredPort
+	var err error
 	if port > 0 {
 		if !a.isPortFree(port) || !a.reserveProxyPort(port) {
 			logrus.Warnf("Requested proxy port %d unavailable; selecting a new port", port)
-			var err error
 			port, err = a.nextReservablePort(a.nextProxyPort)
 			if err != nil { return err }
 		}
 	} else {
-		var err error
 		port, err = a.nextReservablePort(a.nextProxyPort)
 		if err != nil { return err }
 	}
 	a.nextProxyPort = port + 1
-	// Build a kubeconfig context that defaults to the namespace
-	kubeconfig := filepath.Join(os.Getenv("HOME"), ".kwok", "clusters", a.config.MainClusterName, "kubeconfig.yaml")
-	// Create a derived kubeconfig at temp path with namespace override via --namespace on kubectl proxy (not supported),
-	// instead we'll rely on Rancher accessing full API paths; kubectl proxy exposes cluster-wide API. Namespace scoping isn't required.
-	// Start kubectl proxy
-	startProxy := func(p int) (*exec.Cmd, error) {
-		cmd := exec.Command("kubectl", "--kubeconfig", kubeconfig, "proxy", "--address=127.0.0.1", fmt.Sprintf("--port=%d", p))
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Start(); err != nil {
-			return nil, err
-		}
-		return cmd, nil
-	}
-	// Try to start the proxy and verify the port is listening AND owned by our process; retry if needed
-	var cmd *exec.Cmd
-	for attempt := 1; attempt <= 3; attempt++ {
-		logrus.Infof("Starting kubectl proxy for %s attempt %d on 127.0.0.1:%d", clusterName, attempt, port)
-		c, err := startProxy(port)
-		if err != nil {
-			if strings.Contains(err.Error(), "address already in use") || strings.Contains(err.Error(), "bind: address already in use") {
-				// release current reservation, pick another reservable free port and retry
-				a.releaseProxyPort(port)
-				fp, ferr := a.nextReservablePort(a.nextProxyPort)
-				if ferr != nil { return fmt.Errorf("failed to find fallback port after bind error: %w", ferr) }
-				port = fp
-				a.nextProxyPort = port + 1
-				continue
-			}
-			return fmt.Errorf("failed to start kubectl proxy: %w", err)
-		}
 
-		// Verify the port becomes ready and is owned by our process; if not, kill and retry on a new port
-		ownedReady := false
-		for i := 0; i < 30; i++ { // up to ~3s
-			conn, derr := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 100*time.Millisecond)
-			if derr == nil {
-				_ = conn.Close()
-				if a.portOwnedByPID(port, c.Process.Pid) {
-					ownedReady = true
-					break
-				}
-			}
-			time.Sleep(100 * time.Millisecond)
-		}
-		if ownedReady {
-			cmd = c
-			break
-		}
-	// Not ready; stop this one and try another port
-		_ = c.Process.Kill()
-		logrus.Warnf("kubectl proxy for %s did not become ready on %d; retrying on another port", clusterName, port)
-	a.releaseProxyPort(port)
-	fp, ferr := a.nextReservablePort(a.nextProxyPort)
-	if ferr != nil { return fmt.Errorf("proxy not ready and failed to find new port: %w", ferr) }
-	port = fp
-		a.nextProxyPort = port + 1
-	}
-	if cmd == nil {
-	a.releaseProxyPort(port)
-		return fmt.Errorf("failed to start kubectl proxy after retries")
+	// Build upstream base URL (cached)
+	if a.mainAPIServerURL == nil {
+		// Assume KWOK main API server is listening on localhost:MainAPIPort using HTTP (kwok default). If TLS later, adjust scheme.
+		u, perr := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", a.config.MainAPIPort))
+		if perr != nil { return perr }
+		a.mainAPIServerURL = u
 	}
 
-	// Only record mapping once confirmed ready
-	a.proxyCmds[clusterID] = cmd
+	// Reverse proxy handler: minimal subset replicating 'kubectl proxy' behaviour (no auth translation; straight pass-through).
+	director := func(r *http.Request) {
+		// Preserve original path & query; just rewrite scheme/host.
+		r.URL.Scheme = a.mainAPIServerURL.Scheme
+		r.URL.Host = a.mainAPIServerURL.Host
+		// Remove Accept-Encoding to let Go transparently decompress if needed and possibly simplify Rancher expectations.
+		r.Header.Del("Accept-Encoding")
+	}
+	proxy := &httputil.ReverseProxy{Director: director, ModifyResponse: func(resp *http.Response) error { return nil }, ErrorHandler: func(w http.ResponseWriter, r *http.Request, e error) {
+		logrus.Debugf("proxy error cluster=%s path=%s err=%v", clusterName, r.URL.Path, e)
+		http.Error(w, fmt.Sprintf("proxy error: %v", e), http.StatusBadGateway)
+	}}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// Optionally we could inject an impersonated namespace context, but Rancher will pass full paths already.
+		proxy.ServeHTTP(w, r)
+	})
+
+	srv := &http.Server{Addr: fmt.Sprintf("127.0.0.1:%d", port), Handler: mux}
+	a.proxyServers[clusterID] = srv
 	a.proxyPorts[clusterID] = port
 	_ = a.SaveState()
-	go func(id string, c *exec.Cmd) {
-		_ = c.Wait()
-		delete(a.proxyCmds, id)
-		if p, ok := a.proxyPorts[id]; ok {
-			a.releaseProxyPort(p)
+
+	go func(id string, s *http.Server, p int) {
+		logrus.Infof("Starting in-process API proxy for cluster %s on 127.0.0.1:%d -> %s", clusterName, p, a.mainAPIServerURL)
+		if err := s.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logrus.Errorf("proxy server for %s exited with error: %v", clusterName, err)
 		}
+		delete(a.proxyServers, id)
+		a.releaseProxyPort(p)
 		delete(a.proxyPorts, id)
 		_ = a.SaveState()
-	}(clusterID, cmd)
-	logrus.Infof("Started kubectl proxy for cluster %s on 127.0.0.1:%d (main=%s)", clusterName, port, a.config.MainClusterName)
+	}(clusterID, srv, port)
 	return nil
 }
 
@@ -676,10 +642,23 @@ func (a *ScaleAgent) portOwnedByPID(port int, pid int) bool {
 }
 
 func (a *ScaleAgent) stopProxyForCluster(clusterID string) {
+	// Stop legacy kubectl proxy process if present
 	if cmd, ok := a.proxyCmds[clusterID]; ok && cmd.Process != nil {
 		_ = cmd.Process.Kill()
 		delete(a.proxyCmds, clusterID)
 	}
+	// Stop in-process reverse proxy server if present
+	if srv, ok := a.proxyServers[clusterID]; ok {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = srv.Shutdown(ctx)
+		cancel()
+		delete(a.proxyServers, clusterID)
+	}
+	if p, ok := a.proxyPorts[clusterID]; ok {
+		delete(a.proxyPorts, clusterID)
+		a.releaseProxyPort(p)
+	}
+	_ = a.SaveState()
 }
 
 func (a *ScaleAgent) createDefaultClusterTemplate() error {

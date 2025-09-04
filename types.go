@@ -1,15 +1,16 @@
 package main
 
 import (
-	"context"
-	"encoding/json"
-	"fmt"
-	"net/http"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"sync"
-	"time"
+    "context"
+    "encoding/json"
+    "fmt"
+    "net/http"
+    "net/url"
+    "os"
+    "os/exec"
+    "path/filepath"
+    "sync"
+    "time"
 )
 
 // Config holds runtime configuration for the agent.
@@ -64,12 +65,17 @@ type ScaleAgent struct {
     connecting     map[string]bool
 
     // Multi-tenant proxy management
-    proxyPorts     map[string]int       // clusterID -> local proxy port
-    proxyCmds      map[string]*exec.Cmd // clusterID -> running kubectl proxy command
+    proxyPorts     map[string]int        // clusterID -> local proxy port
+    proxyServers   map[string]*http.Server // clusterID -> in-process reverse proxy server
+    // (legacy) proxyCmds retained only for backward compatibility if needed; not used for new in-process mux proxy
+    proxyCmds      map[string]*exec.Cmd  // clusterID -> (legacy) running kubectl proxy command
     nextProxyPort  int
     // Port allocation guard to avoid races between goroutines
     portAllocMu        sync.Mutex
     reservedProxyPorts map[int]bool
+
+    // Cached upstream KWOK apiserver URL
+    mainAPIServerURL *url.URL
 
     // Synchronization
     connMutex sync.RWMutex
