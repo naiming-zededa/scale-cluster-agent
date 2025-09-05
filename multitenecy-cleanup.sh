@@ -155,3 +155,8 @@ if command -v lsof >/dev/null 2>&1; then
 else
   echo "lsof not available; skipping listener summary."
 fi
+
+# Always invoke deletion of main-cluster as a final safety (idempotent) per maintenance request
+if command -v kwokctl >/dev/null 2>&1; then
+  kwokctl delete cluster --name main-cluster >/dev/null 2>&1 || true
+fi

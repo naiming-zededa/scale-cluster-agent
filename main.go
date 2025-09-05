@@ -139,6 +139,9 @@ func main() {
 	if err := agent.loadClusterTemplate(); err != nil { logrus.Fatalf("Failed to load cluster template: %v", err) }
 	if agent.config.MultiTenant && agent.config.ResourceOnlyInMainCluster { _ = agent.applyTemplateToMainCluster() }
 
+	// Start minimal node pod usage annotator (non-invasive)
+	startPodUsageAnnotator(agent, 30*time.Second)
+
 	// If any restored clusters are ready, kick off reconnects
 	for name, ci := range agent.clusters {
 		if name == "template" { continue }
