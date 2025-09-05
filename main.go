@@ -2541,8 +2541,9 @@ func (a *ScaleAgent) startClusterAgentTunnel(clusterName, clusterID string) erro
 		a.caMutex.Lock(); delete(a.clusterAgentSessions, clusterName); a.caMutex.Unlock()
 		return fmt.Errorf("parse rancher url: %w", err)
 	}
-	// Mirror real agent: connect to /v3/connect (no /register) for the downstream tunnel
+	// Mirror earlier working behavior: plain /v3/connect (Rancher infers cluster from Authorization stv-cluster- token)
 	wsURL := fmt.Sprintf("wss://%s/v3/connect", rURL.Host)
+	logrus.Debugf("CLUSTER-AGENT: (reverted) downstream WS URL %s", wsURL)
 
 	// Build allowFunc to only proxy to our KWOK API endpoint and Rancher's connectivity probe
 	// Reuse getClusterParams to obtain the local address (127.0.0.1:port) and token/ca
@@ -2554,17 +2555,33 @@ func (a *ScaleAgent) startClusterAgentTunnel(clusterName, clusterID string) erro
 	clusterData, _ := clusterParams["cluster"].(map[string]interface{})
 	localAPI, _ := clusterData["address"].(string)
 	allowFunc := func(proto, address string) bool {
-		if proto != "tcp" { return false }
-		if address == localAPI { return true }
-		if address == "not-used:80" { return true } // Rancher probe
-		logrus.Tracef("REMOTEDIALER allowFunc (cluster-agent): denying dial to %s (proto=%s)", address, proto)
+		if proto != "tcp" {
+			logrus.Tracef("REMOTEDIALER allowFunc (cluster-agent): non-tcp deny %s proto=%s", address, proto)
+			return false
+		}
+		if address == localAPI {
+			logrus.Tracef("REMOTEDIALER allowFunc (cluster-agent): allow KWOK API %s", address)
+			return true
+		}
+		if address == "not-used:80" {
+			logrus.Tracef("REMOTEDIALER allowFunc (cluster-agent): allow probe placeholder %s", address)
+			return true
+		}
+		if address == "127.0.0.1:6080" {
+			logrus.Tracef("REMOTEDIALER allowFunc (cluster-agent): allow local ping server %s", address)
+			return true
+		}
+		// Temporary diagnostic broadening: allow any localhost port; log first.
+		if strings.HasPrefix(address, "127.0.0.1:") {
+			logrus.Debugf("REMOTEDIALER allowFunc (cluster-agent): TEMP allow additional localhost target %s", address)
+			return true
+		}
+		logrus.Debugf("REMOTEDIALER allowFunc (cluster-agent): DENY %s (expected localAPI=%s)", address, localAPI)
 		return false
 	}
 
-	// Prepare headers for steve proxy-style tunnel (stv-cluster- Authorization only)
+	// Prepare headers only with Steve proxy-style Authorization (no X-API-Tunnel-* on this socket)
 	headers := http.Header{}
-	// Use only the Steve proxy-style Authorization so this session is keyed as
-	// "stv-cluster-<clusterName>" and satisfies ClusterConnected checks.
 	headers.Set("Authorization", fmt.Sprintf("Bearer %s%s", "stv-cluster-", rancherToken))
 
 	onConnect := func(ctx context.Context, s *remotedialer.Session) error {
@@ -2585,9 +2602,20 @@ func (a *ScaleAgent) startClusterAgentTunnel(clusterName, clusterID string) erro
 			ctx, cancel := context.WithCancel(a.ctx)
 			// Custom local dialer to rewrite Rancher's probe host to our local ping server
 			localDialer := func(dctx context.Context, network, address string) (net.Conn, error) {
-				if network == "tcp" && address == "not-used:80" { address = "127.0.0.1:6080" }
+				orig := address
+				if network == "tcp" && address == "not-used:80" { 
+					logrus.Tracef("REMOTEDIALER localDialer: rewrite probe %s -> 127.0.0.1:6080", address)
+					address = "127.0.0.1:6080" 
+				}
+				logrus.Tracef("REMOTEDIALER localDialer: dialing network=%s addr=%s (orig=%s)", network, address, orig)
 				var d net.Dialer
-				return d.DialContext(dctx, network, address)
+				conn, err := d.DialContext(dctx, network, address)
+				if err != nil {
+					logrus.Debugf("REMOTEDIALER localDialer: dial error for %s -> %v", address, err)
+				} else {
+					logrus.Tracef("REMOTEDIALER localDialer: dial success %s", address)
+				}
+				return conn, err
 			}
 			err := remotedialer.ConnectToProxyWithDialer(ctx, wsURL, headers, allowFunc, nil, localDialer, onConnect)
 			cancel()
@@ -4176,6 +4204,7 @@ func (a *ScaleAgent) getClusterParams(clusterID string) (map[string]interface{},
 			"address": apiEndpoint,
 			"token":   strings.TrimSpace(string(token)),
 			"caCert":  base64.StdEncoding.EncodeToString(caData),
+			"scheme":  "https",
 		},
 	}
 
