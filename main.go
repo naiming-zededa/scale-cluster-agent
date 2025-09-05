@@ -27,10 +27,10 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"runtime"
 	pprof "runtime/pprof"
 	"strconv"
 	"strings"
+	"sort"
 	"sync"
 	"syscall"
 	"time"
@@ -38,6 +38,8 @@ import (
 	"github.com/gorilla/mux"
 	pkgerrors "github.com/pkg/errors"
 	"github.com/rancher/remotedialer"
+
+	// removed gorilla/mux and other external imports not needed in trimmed main path
 	"github.com/sirupsen/logrus"
 	yaml3 "gopkg.in/yaml.v3"
 )
@@ -51,151 +53,91 @@ func main() {
 	})
 	// Default to Info until config overrides it
 	logrus.SetLevel(logrus.InfoLevel)
-
-	logrus.Infof("Scale Cluster Agent version %s starting", version)
-
-	// Load configuration
+	// Load config
 	config, err := loadConfig()
 	if err != nil {
-		logrus.Fatalf("Failed to load configuration: %v", err)
+		logrus.Fatalf("Failed to load config: %v", err)
 	}
+	// Adjust log level
+	if lvl, err := logrus.ParseLevel(config.LogLevel); err == nil { logrus.SetLevel(lvl) }
+	logrus.Infof("Scale Cluster Agent version dev starting")
 
-	// Set log level from config
-	if config.LogLevel != "" {
-		level, err := logrus.ParseLevel(config.LogLevel)
-		if err == nil {
-			logrus.SetLevel(level)
-			logrus.Infof("Log level set to %s (from config)", logrus.GetLevel().String())
-		}
-	}
-
-	// Create context with cancellation
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Create scale agent
 	agent := &ScaleAgent{
 		config:            config,
-		clusters:          make(map[string]*ClusterInfo),
 		ctx:               ctx,
 		cancel:            cancel,
+		clusters:          make(map[string]*ClusterInfo),
 		activeConnections: make(map[string]bool),
 		clusterAgentSessions: make(map[string]bool),
-		connMutex:         sync.RWMutex{},
-		caMutex:           sync.RWMutex{},
+		connectCancels:    make(map[string]context.CancelFunc),
 		tokenCache:        make(map[string]string),
 		mockServers:       make(map[string]*http.Server),
 		portForwarders:    make(map[string]*PortForwarder),
-		nextPort:          1, // Start from port 8001
 		nameCounters:      make(map[string]int),
 		connecting:        make(map[string]bool),
+		proxyPorts:        make(map[string]int),
+		proxyServers:      make(map[string]*http.Server),
+		proxyCmds:         make(map[string]*exec.Cmd),
 		lastConnectAttempt:   make(map[string]time.Time),
 		lastCAConnectAttempt: make(map[string]time.Time),
-		proxyPorts:        make(map[string]int),
-		proxyCmds:         make(map[string]*exec.Cmd),
-		proxyServers:      make(map[string]*http.Server),
-		nextProxyPort:     0, // will be set after config load
-		reservedProxyPorts: make(map[int]bool),
 	}
 
-	// Start local ping server for stv-cluster health checks
-	agent.startLocalPingServer()
-
-	// Start optional pprof server and memory logging
-	if config.PprofEnable {
-		pprofPort := config.PprofPort
-		if pprofPort == 0 { pprofPort = 6060 }
-		go func() {
-			addr := fmt.Sprintf(":%d", pprofPort)
-			logrus.Infof("pprof enabled on %s", addr)
-			if err := http.ListenAndServe(addr, nil); err != nil && err != http.ErrServerClosed {
-				logrus.Warnf("pprof server error: %v", err)
-			}
-		}()
-		if config.MemLogIntervalSec > 0 {
-			go func() {
-				t := time.NewTicker(time.Duration(config.MemLogIntervalSec) * time.Second)
-				defer t.Stop()
-				for {
-					select {
-					case <-t.C:
-						var ms runtime.MemStats
-						runtime.ReadMemStats(&ms)
-						logrus.WithFields(logrus.Fields{
-							"alloc_mb":          float64(ms.Alloc) / (1024*1024),
-							"heap_alloc_mb":     float64(ms.HeapAlloc) / (1024*1024),
-							"heap_inuse_mb":     float64(ms.HeapInuse) / (1024*1024),
-							"heap_idle_mb":      float64(ms.HeapIdle) / (1024*1024),
-							"num_gc":            ms.NumGC,
-							"next_gc_mb":        float64(ms.NextGC) / (1024*1024),
-							"num_goroutine":     runtime.NumGoroutine(),
-						}).Info("memstats")
-					case <-ctx.Done():
-						return
-					}
-				}
-			}()
-		}
-	}
-
-	// Setup HTTP server early so we don't block listening on 9090 during KWOK setup
+	// Basic HTTP router
 	router := mux.NewRouter()
-	router.HandleFunc("/health", agent.healthHandler).Methods("GET")
-	router.HandleFunc("/clusters", agent.createClusterHandler).Methods("POST")
-	router.HandleFunc("/clusters", agent.listClustersHandler).Methods("GET")
-	router.HandleFunc("/clusters/{name}", agent.deleteClusterHandler).Methods("DELETE")
+	// Core endpoints
+	router.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request){ w.WriteHeader(http.StatusOK); _,_ = w.Write([]byte("ok")) })
+	router.HandleFunc("/clusters", agent.createClusterHandler).Methods(http.MethodPost)
+	router.HandleFunc("/clusters", agent.listClustersHandler).Methods(http.MethodGet)
+	// GET single cluster
+	router.HandleFunc("/clusters/{name}", func(w http.ResponseWriter, r *http.Request){
+		vars := mux.Vars(r)
+		name := vars["name"]
+		if name == "" { http.Error(w, "missing name", http.StatusBadRequest); return }
+		ci, ok := agent.clusters[name]
+		if !ok { http.Error(w, "not found", http.StatusNotFound); return }
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(ci)
+	}).Methods(http.MethodGet)
+	router.HandleFunc("/clusters/{name}", agent.deleteClusterHandler).Methods(http.MethodDelete)
 
-	agent.httpServer = &http.Server{
-		Addr:    fmt.Sprintf(":%d", config.ListenPort),
-		Handler: router,
-	}
+	agent.httpServer = &http.Server{ Addr: fmt.Sprintf(":%d", config.ListenPort), Handler: router }
 
-	go func() {
+	// Lightweight probe server for Rancher connectivity probe rewrites (not-used:80 -> 127.0.0.1:6080)
+	go func(){
+		muxPing := http.NewServeMux()
+		muxPing.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request){ w.WriteHeader(http.StatusOK); _,_ = w.Write([]byte("pong")) })
+		_ = http.ListenAndServe("127.0.0.1:6080", muxPing)
+	}()
+	go func(){
 		logrus.Infof("Starting HTTP server on port %d", config.ListenPort)
 		if err := agent.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logrus.Fatalf("HTTP server error: %v", err)
 		}
 	}()
 
-	// Initialize KWOK cluster manager with absolute paths
-	kwokctlPath, err := filepath.Abs("./kwokctl")
-	if err != nil {
-		logrus.Fatalf("Failed to get absolute path for kwokctl: %v", err)
-	}
-	kwokPath, err := filepath.Abs("./kwok")
-	if err != nil {
-		logrus.Fatalf("Failed to get absolute path for kwok: %v", err)
-	}
-
+	// Initialize KWOK manager
+	kwokctlPath, _ := filepath.Abs("./kwokctl")
+	kwokPath, _ := filepath.Abs("./kwok")
 	logrus.Infof("Using kwokctl path: %s", kwokctlPath)
 	logrus.Infof("Using kwok path: %s", kwokPath)
-
 	agent.kwokManager = NewKWOKClusterManager(kwokctlPath, kwokPath, 8001, config.Audit)
-	// Rebuild KWOK cluster mappings from disk so restarts can reconnect without a POST
 	agent.kwokManager.RehydrateFromDisk()
-	// If multi-tenant mode, ensure the main KWOK cluster is present
 	if agent.config.MultiTenant {
 		if _, err := agent.kwokManager.EnsureMainCluster(agent.config.MainClusterName, agent.config.MainAPIPort); err != nil {
 			logrus.Fatalf("Failed to ensure main KWOK cluster %s: %v", agent.config.MainClusterName, err)
 		}
 	}
 
-	// Attempt to load previous state (clusters + kwok mappings)
 	if err := agent.LoadState(); err != nil {
 		logrus.Warnf("Failed to load persisted state: %v", err)
 	}
-	// Initialize proxy port counter
-	if agent.config.ProxyBasePort > 0 {
-		agent.nextProxyPort = agent.config.ProxyBasePort
-	} else {
-		agent.nextProxyPort = 8440
-	}
+	if agent.config.ProxyBasePort > 0 { agent.nextProxyPort = agent.config.ProxyBasePort } else { agent.nextProxyPort = 8440 }
 
-	// Load cluster template
-	err = agent.loadClusterTemplate()
-	if err != nil {
-		logrus.Fatalf("Failed to load cluster template: %v", err)
-	}
+	if err := agent.loadClusterTemplate(); err != nil { logrus.Fatalf("Failed to load cluster template: %v", err) }
+	if agent.config.MultiTenant && agent.config.ResourceOnlyInMainCluster { _ = agent.applyTemplateToMainCluster() }
 
 	// If any restored clusters are ready, kick off reconnects
 	for name, ci := range agent.clusters {
@@ -220,12 +162,16 @@ func main() {
 				if err := agent.startProxyForCluster(ci.ClusterID, ci.Name, port); err != nil {
 					logrus.Warnf("Failed to restart proxy for %s: %v", ci.Name, err)
 				}
-				// Best-effort repopulate minimal tenant resources if absent
-				go func(cn, cid string){
-					if err := agent.populateTenantFromTemplate(cn, cid); err != nil {
-						logrus.Debugf("populateTenantFromTemplate on restart for %s: %v", cn, err)
-					}
-				}(ci.Name, ci.ClusterID)
+				// Best-effort repopulate minimal tenant resources if absent unless restricted to main cluster only
+				if !agent.config.ResourceOnlyInMainCluster {
+					go func(cn, cid string){
+						if err := agent.populateTenantFromTemplate(cn, cid); err != nil {
+							logrus.Debugf("populateTenantFromTemplate on restart for %s: %v", cn, err)
+						}
+					}(ci.Name, ci.ClusterID)
+				} else {
+					logrus.Debugf("ResourceOnlyInMainCluster=true; skipping tenant repopulation for %s", ci.Name)
+				}
 			}
 		}
 	}
@@ -379,6 +325,8 @@ func loadConfig() (*Config, error) {
 				if v, ok := ycfg["MemLogIntervalSec"].(int); ok { config.MemLogIntervalSec = v } else if v2, ok2 := ycfg["MemLogIntervalSec"].(float64); ok2 { config.MemLogIntervalSec = int(v2) } else if v3, ok3 := ycfg["MemLogIntervalSec"].(string); ok3 { if p, perr := strconv.Atoi(strings.TrimSpace(v3)); perr == nil { config.MemLogIntervalSec = p } }
 				// Audit
 				if v, ok := ycfg["Audit"].(bool); ok { config.Audit = v } else if v2, ok2 := ycfg["Audit"].(string); ok2 { lv := strings.ToLower(strings.TrimSpace(v2)); config.Audit = (lv == "1" || lv == "true" || lv == "yes") }
+				// ResourceOnlyInMainCluster (missing earlier)
+				if v, ok := ycfg["ResourceOnlyInMainCluster"].(bool); ok { config.ResourceOnlyInMainCluster = v } else if v2, ok2 := ycfg["ResourceOnlyInMainCluster"].(string); ok2 { lv := strings.ToLower(strings.TrimSpace(v2)); config.ResourceOnlyInMainCluster = (lv == "1" || lv == "true" || lv == "yes") }
 			} else {
 				// Very naive key:value fallback
 				lines := strings.Split(string(data), "\n")
@@ -403,6 +351,7 @@ func loadConfig() (*Config, error) {
 					case "PprofPort": if p, err := strconv.Atoi(v); err == nil { config.PprofPort = p }
 					case "MemLogIntervalSec": if p, err := strconv.Atoi(v); err == nil { config.MemLogIntervalSec = p }
 					case "Audit": lv := strings.ToLower(strings.TrimSpace(v)); config.Audit = (lv == "1" || lv == "true" || lv == "yes")
+					case "ResourceOnlyInMainCluster": lv := strings.ToLower(strings.TrimSpace(v)); config.ResourceOnlyInMainCluster = (lv == "1" || lv == "true" || lv == "yes")
 					}
 				}
 			}
@@ -418,6 +367,7 @@ func loadConfig() (*Config, error) {
 	if v := os.Getenv("SCALE_AGENT_PPROF_PORT"); v != "" { if p, perr := strconv.Atoi(strings.TrimSpace(v)); perr == nil { config.PprofPort = p } }
 	if v := os.Getenv("SCALE_AGENT_MEM_LOG_INTERVAL"); v != "" { if p, perr := strconv.Atoi(strings.TrimSpace(v)); perr == nil { config.MemLogIntervalSec = p } }
 	if v := os.Getenv("SCALE_AGENT_AUDIT"); v != "" { lv := strings.ToLower(strings.TrimSpace(v)); config.Audit = (lv == "1" || lv == "true" || lv == "yes") }
+	if v := os.Getenv("SCALE_AGENT_RESOURCES_MAIN"); v != "" { lv := strings.ToLower(strings.TrimSpace(v)); config.ResourceOnlyInMainCluster = (lv == "1" || lv == "true" || lv == "yes") }
 
 	// Normalize/trim
 	config.RancherURL = strings.TrimSpace(config.RancherURL)
@@ -438,8 +388,8 @@ func loadConfig() (*Config, error) {
 	if config.ProxyBasePort == 0 { config.ProxyBasePort = 8440 }
 	if config.PprofPort == 0 { config.PprofPort = 6060 }
 
-	logrus.Infof("Using config: RancherURL=%s ListenPort=%d LogLevel=%s MultiTenant=%v MainClusterName=%s MainAPIPort=%d ProxyBasePort=%d PprofEnable=%v PprofPort=%d MemLogIntervalSec=%d Audit=%v",
-		config.RancherURL, config.ListenPort, config.LogLevel, config.MultiTenant, config.MainClusterName, config.MainAPIPort, config.ProxyBasePort, config.PprofEnable, config.PprofPort, config.MemLogIntervalSec, config.Audit)
+	logrus.Infof("Using config: RancherURL=%s ListenPort=%d LogLevel=%s MultiTenant=%v MainClusterName=%s MainAPIPort=%d ProxyBasePort=%d PprofEnable=%v PprofPort=%d MemLogIntervalSec=%d Audit=%v ResourceOnlyInMainCluster=%v",
+		config.RancherURL, config.ListenPort, config.LogLevel, config.MultiTenant, config.MainClusterName, config.MainAPIPort, config.ProxyBasePort, config.PprofEnable, config.PprofPort, config.MemLogIntervalSec, config.Audit, config.ResourceOnlyInMainCluster)
 	// Log a safe token identifier (prefix before ':') for debugging
 	if idx := strings.Index(config.BearerToken, ":"); idx > 0 { logrus.Infof("Using Rancher token ID: %s (secret masked)", config.BearerToken[:idx]) }
 	return &config, nil
@@ -469,6 +419,147 @@ func (a *ScaleAgent) loadClusterTemplate() error {
 	a.clusters["template"] = &clusterInfo
 	return nil
 }
+
+// applyTemplateToMainCluster applies cluster.yaml resources directly into the main cluster (single scope) when configured.
+// applyTemplateToMainCluster applies cluster.yaml resources into the main KWOK cluster once when configured.
+func (a *ScaleAgent) applyTemplateToMainCluster() error {
+		if !a.config.MultiTenant { return nil }
+		if !a.config.ResourceOnlyInMainCluster { return nil }
+		tmpl := a.clusters["template"]
+		if tmpl == nil { return nil }
+		kubeconfig := filepath.Join(os.Getenv("HOME"), ".kwok", "clusters", a.config.MainClusterName, "kubeconfig.yaml")
+		logrus.Infof("Applying template resources to main cluster %s (single-scope mode)", a.config.MainClusterName)
+
+		applyYAML := func(y string) error {
+			// Safety: eliminate any stray tab characters and CR that could break kubectl YAML parsing
+			y = strings.ReplaceAll(y, "\t", "  ")
+			y = strings.ReplaceAll(y, "\r", "")
+				cmd := exec.Command("kubectl", "--kubeconfig", kubeconfig, "apply", "-f", "-")
+				cmd.Stdin = strings.NewReader(y)
+				if out, err := cmd.CombinedOutput(); err != nil {
+						logrus.Warnf("applyTemplateToMainCluster: kubectl apply failed: %v\nYAML:\n%s\nOutput: %s", err, y, string(out))
+						return err
+				}
+				return nil
+		}
+		fmtLabels := func(labels map[string]string, indent int) string {
+			if len(labels) == 0 { return "" }
+			var b strings.Builder
+			pad := strings.Repeat(" ", indent)
+			keys := make([]string, 0, len(labels))
+			for k := range labels { keys = append(keys, k) }
+			sort.Strings(keys)
+			for _, k := range keys {
+				v := labels[k]
+				// Always quote to avoid YAML bool/int coercion (e.g. true -> bool)
+				b.WriteString(fmt.Sprintf("%s%s: \"%s\"\n", pad, k, v))
+			}
+			return b.String()
+		}
+
+		// Pre-create any non-default namespaces referenced by template objects.
+		nsSet := map[string]struct{}{}
+		for _, p := range tmpl.Pods { ns := defaultIfEmpty(p.Namespace, "default"); nsSet[ns] = struct{}{} }
+		for _, s := range tmpl.Services { ns := defaultIfEmpty(s.Namespace, "default"); nsSet[ns] = struct{}{} }
+		for _, c := range tmpl.ConfigMaps { ns := defaultIfEmpty(c.Namespace, "default"); nsSet[ns] = struct{}{} }
+		for _, s := range tmpl.Secrets { ns := defaultIfEmpty(s.Namespace, "default"); nsSet[ns] = struct{}{} }
+		for _, d := range tmpl.Deployments { ns := defaultIfEmpty(d.Namespace, "default"); nsSet[ns] = struct{}{} }
+		for ns := range nsSet {
+			if ns == "" || ns == "default" { continue }
+			nsYAML := fmt.Sprintf("apiVersion: v1\nkind: Namespace\nmetadata:\n  name: %s\n", ns)
+			_ = applyYAML(nsYAML) // ignore error (already exists)
+		}
+		// Nodes
+		for _, n := range tmpl.Nodes {
+			name := strings.ReplaceAll(defaultIfEmpty(n.Name, "{{cluster-name}}-node1"), "{{cluster-name}}", a.config.MainClusterName)
+			labels := map[string]string{"kwok.x-k8s.io/node": "fake"}
+			for _, r := range n.Roles { labels[fmt.Sprintf("node-role.kubernetes.io/%s", r)] = "true" }
+			nodeYAML := fmt.Sprintf("apiVersion: v1\nkind: Node\nmetadata:\n  name: %s\n  annotations:\n    kwok.x-k8s.io/node: fake\n  labels:\n%s", name, fmtLabels(labels, 4))
+				_ = applyYAML(nodeYAML)
+				if len(n.Capacity) > 0 || len(n.Allocatable) > 0 {
+						if err := a.patchNodeStatus(kubeconfig, name, n.Capacity, n.Allocatable); err != nil {
+								logrus.Warnf("main node status patch failed: %v", err)
+						}
+				}
+		}
+		// Pods
+		for _, p := range tmpl.Pods {
+			podName := strings.ReplaceAll(defaultIfEmpty(p.Name, "demo-0"), "{{cluster-name}}", a.config.MainClusterName)
+			ns := defaultIfEmpty(p.Namespace, "default")
+				labels := fmtLabels(p.Labels, 4)
+				labelsSection := "  labels: {}\n"
+				if labels != "" {
+					labelsSection = "  labels:\n" + labels
+				}
+			nodeName := strings.ReplaceAll(p.Node, "{{cluster-name}}", a.config.MainClusterName)
+				podYAML := fmt.Sprintf("apiVersion: v1\nkind: Pod\nmetadata:\n  name: %s\n  namespace: %s\n%s\nspec:\n  nodeName: %s\n  containers:\n  - name: pause\n    image: registry.k8s.io/pause:3.9\n", podName, ns, labelsSection, nodeName)
+			_ = applyYAML(podYAML)
+		}
+		// Services
+		for _, s := range tmpl.Services {
+				name := strings.ReplaceAll(s.Name, "{{cluster-name}}", a.config.MainClusterName)
+				ns := defaultIfEmpty(s.Namespace, "default")
+					labels := fmtLabels(s.Labels, 4)
+					labelsSection := "  labels: {}\n"
+					if labels != "" {
+						labelsSection = "  labels:\n" + labels
+					}
+				var portsSpec strings.Builder
+				added := 0
+				seen := map[string]bool{}
+				if s.Ports != "" {
+						parts := strings.Split(s.Ports, ",")
+						idx := 0
+						for _, raw := range parts {
+								raw = strings.TrimSpace(raw)
+								if raw == "" { continue }
+								proto := "TCP"
+								if slash := strings.LastIndex(raw, "/"); slash != -1 { proto = strings.ToUpper(strings.TrimSpace(raw[slash+1:])); raw = strings.TrimSpace(raw[:slash]) }
+								portStr := raw
+								if colon := strings.Index(raw, ":"); colon != -1 { portStr = raw[:colon] }
+								if pnum, perr := strconv.Atoi(strings.TrimSpace(portStr)); perr == nil {
+										base := fmt.Sprintf("p%d", pnum)
+										cand := base
+										for seen[cand] { idx++; cand = fmt.Sprintf("%s-%d", base, idx) }
+										seen[cand] = true
+										portsSpec.WriteString(fmt.Sprintf("  - name: %s\n    port: %d\n    targetPort: %d\n    protocol: %s\n", cand, pnum, pnum, proto))
+										added++
+								}
+						}
+				}
+				if added == 0 { portsSpec.WriteString("  - name: p80\n    port: 80\n    targetPort: 80\n    protocol: TCP\n") }
+			serviceYAML := fmt.Sprintf("apiVersion: v1\nkind: Service\nmetadata:\n  name: %s\n  namespace: %s\n%s\nspec:\n  type: %s\n  selector:\n    app: placeholder\n  ports:\n%s", name, ns, labelsSection, defaultIfEmpty(s.Type, "ClusterIP"), portsSpec.String())
+				_ = applyYAML(serviceYAML)
+		}
+		// ConfigMaps
+		for _, cm := range tmpl.ConfigMaps {
+				name := strings.ReplaceAll(cm.Name, "{{cluster-name}}", a.config.MainClusterName)
+				ns := defaultIfEmpty(cm.Namespace, "default")
+			cmYAML := fmt.Sprintf("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: %s\n  namespace: %s\ndata: {}\n", name, ns)
+				_ = applyYAML(cmYAML)
+		}
+		// Secrets (skip service-account tokens)
+		for _, sec := range tmpl.Secrets {
+				name := strings.ReplaceAll(sec.Name, "{{cluster-name}}", a.config.MainClusterName)
+				ns := defaultIfEmpty(sec.Namespace, "default")
+				stype := defaultIfEmpty(sec.Type, "Opaque")
+				if stype == "kubernetes.io/service-account-token" { continue }
+			secretYAML := fmt.Sprintf("apiVersion: v1\nkind: Secret\nmetadata:\n  name: %s\n  namespace: %s\ntype: %s\ndata: {}\n", name, ns, stype)
+				_ = applyYAML(secretYAML)
+		}
+		// Deployments
+		for _, d := range tmpl.Deployments {
+				name := strings.ReplaceAll(d.Name, "{{cluster-name}}", a.config.MainClusterName)
+				ns := defaultIfEmpty(d.Namespace, "default")
+				replicas := 1
+				if v, err := strconv.Atoi(strings.TrimSpace(d.Available)); err == nil && v > 0 { replicas = v }
+			depYAML := fmt.Sprintf("apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: %s\n  namespace: %s\nspec:\n  replicas: %d\n  selector:\n    matchLabels:\n      app: %s\n  template:\n    metadata:\n      labels:\n        app: %s\n    spec:\n      containers:\n      - name: pause\n        image: registry.k8s.io/pause:3.9\n", name, ns, replicas, name, name)
+				_ = applyYAML(depYAML)
+		}
+		logrus.Infof("Main-cluster template apply summary: nodes=%d pods=%d services=%d configmaps=%d secrets=%d deployments=%d", len(tmpl.Nodes), len(tmpl.Pods), len(tmpl.Services), len(tmpl.ConfigMaps), len(tmpl.Secrets), len(tmpl.Deployments))
+		return nil
+}
+// (removed duplicate earlier version of applyTemplateToMainCluster)
 
 // ensureNamespaceOnMain creates the namespace for a logical cluster on the main KWOK cluster (idempotent).
 func (a *ScaleAgent) ensureNamespaceOnMain(clusterName string) error {
@@ -937,6 +1028,11 @@ func valueOr(m map[string]string, key, def string) string {
 // populateTenantFromTemplate applies namespaced resources from the template into the tenant namespace,
 // and creates tenant-labeled Nodes (cluster-scoped) to satisfy workloads listing.
 func (a *ScaleAgent) populateTenantFromTemplate(clusterName, clusterID string) error {
+	// When configured to apply resources only in the main cluster, skip any per-tenant population entirely.
+	if a.config.MultiTenant && a.config.ResourceOnlyInMainCluster {
+		logrus.Debugf("ResourceOnlyInMainCluster=true; skipping populateTenantFromTemplate for %s", clusterName)
+		return nil
+	}
 	// Get template or fall back to defaults
 	tmpl := a.clusters["template"]
 	if tmpl == nil {
@@ -1058,6 +1154,140 @@ spec:
 			}
 		}
 
+		// --- Services ---
+		for _, s := range tmpl.Services {
+			name := strings.ReplaceAll(s.Name, "{{cluster-name}}", clusterName)
+			lbls := labelsWithCluster(s.Labels)
+			var portsSpec strings.Builder
+			added := 0
+			seenNames := map[string]bool{}
+			if s.Ports != "" {
+				parts := strings.Split(s.Ports, ",")
+				portIndex := 0
+				for _, raw := range parts {
+					raw = strings.TrimSpace(raw)
+					if raw == "" { continue }
+					proto := "TCP"
+					if slash := strings.LastIndex(raw, "/"); slash != -1 {
+						proto = strings.ToUpper(strings.TrimSpace(raw[slash+1:]))
+						raw = strings.TrimSpace(raw[:slash])
+					}
+					portStr := raw
+					if colon := strings.Index(raw, ":"); colon != -1 { // drop nodePort part
+						portStr = raw[:colon]
+					}
+					if pnum, perr := strconv.Atoi(strings.TrimSpace(portStr)); perr == nil {
+						// generate unique name
+						baseName := fmt.Sprintf("p%d", pnum)
+						nameCandidate := baseName
+						for seenNames[nameCandidate] { // disambiguate duplicates (e.g., protocol variations same port)
+							portIndex++
+							nameCandidate = fmt.Sprintf("%s-%d", baseName, portIndex)
+						}
+						seenNames[nameCandidate] = true
+						portsSpec.WriteString(fmt.Sprintf("    - name: %s\n      port: %d\n      targetPort: %d\n      protocol: %s\n", nameCandidate, pnum, pnum, proto))
+						added++
+					}
+				}
+			}
+			if added == 0 { // fallback
+				portsSpec.WriteString("    - name: p80\n      port: 80\n      targetPort: 80\n      protocol: TCP\n")
+			}
+			serviceYAML := fmt.Sprintf(`apiVersion: v1
+kind: Service
+metadata:
+  name: %s
+  namespace: %s
+  labels:
+%s
+spec:
+  type: %s
+  selector:
+    cluster-id: %s
+  ports:
+%s`, name, ns, lbls, defaultIfEmpty(s.Type, "ClusterIP"), clusterName, portsSpec.String())
+			if err := applyYAML(serviceYAML); err != nil {
+				logrus.Warnf("Failed to apply service %s for tenant %s: %v", name, clusterName, err)
+			}
+		}
+
+		// --- ConfigMaps --- (data keys not preserved; create empty shell)
+		for _, cm := range tmpl.ConfigMaps {
+			name := strings.ReplaceAll(cm.Name, "{{cluster-name}}", clusterName)
+			labels := labelsWithCluster(nil)
+			cmYAML := fmt.Sprintf(`apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: %s
+  namespace: %s
+  labels:
+%s
+data: {}
+`, name, ns, labels)
+			if err := applyYAML(cmYAML); err != nil {
+				logrus.Warnf("Failed to apply configmap %s for tenant %s: %v", name, clusterName, err)
+			}
+		}
+
+		// --- Secrets --- (no data content; create type only)
+		for _, sec := range tmpl.Secrets {
+			name := strings.ReplaceAll(sec.Name, "{{cluster-name}}", clusterName)
+			stype := defaultIfEmpty(sec.Type, "Opaque")
+			labels := labelsWithCluster(nil)
+			// Skip kubernetes.io/service-account-token secrets: these are auto-created; manual creation requires annotations & token data.
+			if stype == "kubernetes.io/service-account-token" {
+				logrus.Infof("Skipping template service-account token secret %s (auto-generated by import flow)", name)
+				continue
+			}
+			secretYAML := fmt.Sprintf(`apiVersion: v1
+kind: Secret
+metadata:
+  name: %s
+  namespace: %s
+  labels:
+%s
+type: %s
+data: {}
+`, name, ns, labels, stype)
+			if err := applyYAML(secretYAML); err != nil {
+				logrus.Warnf("Failed to apply secret %s for tenant %s: %v", name, clusterName, err)
+			}
+		}
+
+		// --- Deployments --- (synthesized minimal spec using pause container)
+		for _, d := range tmpl.Deployments {
+			name := strings.ReplaceAll(d.Name, "{{cluster-name}}", clusterName)
+			labels := labelsWithCluster(d.Labels)
+			// choose replica count from Available or Ready if numeric; fallback 1
+			replicas := 1
+			if v, err := strconv.Atoi(strings.TrimSpace(d.Available)); err == nil && v > 0 { replicas = v }
+			deploymentYAML := fmt.Sprintf(`apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: %s
+  namespace: %s
+  labels:
+%s
+spec:
+  replicas: %d
+  selector:
+    matchLabels:
+      app: %s
+      cluster-id: %s
+  template:
+    metadata:
+      labels:
+        app: %s
+        cluster-id: %s
+    spec:
+      containers:
+      - name: pause
+        image: registry.k8s.io/pause:3.9
+`, name, ns, labels, replicas, name, clusterName, name, clusterName)
+			if err := applyYAML(deploymentYAML); err != nil {
+				logrus.Warnf("Failed to apply deployment %s for tenant %s: %v", name, clusterName, err)
+			}
+		}
 		return nil
 }
 // extractCACertFromKubeconfig extracts the CA certificate from KWOK kubeconfig content
@@ -1378,15 +1608,9 @@ func (a *ScaleAgent) connectClusterToRancher(clusterName, clusterID string, clus
 			headers.Set("X-API-Tunnel-Params", encodedParams)
 
 			allowFunc := func(proto, address string) bool {
-				if proto != "tcp" {
-					return false
-				}
-				if address == localAPI {
-					return true
-				}
-				if address == "not-used:80" {
-					return true
-				}
+				if proto != "tcp" { return false }
+				if address == localAPI { return true }
+				if address == "not-used:80" { return true } // Rancher connectivity probe
 				logrus.Tracef("REMOTEDIALER allowFunc: denying dial to %s (proto=%s)", address, proto)
 				return false
 			}
@@ -1564,13 +1788,15 @@ func (a *ScaleAgent) runCompleteClusterSetup(ci *ClusterInfo) {
 		return
 	}
 
-	// Step 2b: In multi-tenant mode, populate tenant-scoped simulated resources from template
-	if a.config.MultiTenant {
+	// Step 2b: In multi-tenant mode, populate tenant-scoped simulated resources from template (unless main-only flag)
+	if a.config.MultiTenant && !a.config.ResourceOnlyInMainCluster {
 		ci.Status = "populating_template"
 		_ = a.SaveState()
 		if err := a.populateTenantFromTemplate(ci.Name, ci.ClusterID); err != nil {
 			logrus.Warnf("Template population for %s encountered issues: %v", ci.Name, err)
 		}
+	} else if a.config.MultiTenant && a.config.ResourceOnlyInMainCluster {
+		logrus.Infof("Skipping per-tenant template population for %s (ResourceOnlyInMainCluster=true)", ci.Name)
 	}
 
 	// Step 3: Wait for service account to be ready (fast-SA path)
@@ -2325,20 +2551,9 @@ func (a *ScaleAgent) startClusterAgentTunnel(clusterName, clusterID string) erro
 	clusterData, _ := clusterParams["cluster"].(map[string]interface{})
 	localAPI, _ := clusterData["address"].(string)
 	allowFunc := func(proto, address string) bool {
-		if proto != "tcp" {
-			return false
-		}
-		if address == localAPI {
-			return true
-		}
-		// Allow Rancher server's connectivity probe host; we'll rewrite it via custom dialer
-		if address == "not-used:80" {
-			return true
-		}
-		// Allow Steve proxy to target local health server 127.0.0.1:6080 via tunnel
-		if address == "127.0.0.1:6080" {
-			return true
-		}
+		if proto != "tcp" { return false }
+		if address == localAPI { return true }
+		if address == "not-used:80" { return true } // Rancher probe
 		logrus.Tracef("REMOTEDIALER allowFunc (cluster-agent): denying dial to %s (proto=%s)", address, proto)
 		return false
 	}
@@ -2367,10 +2582,7 @@ func (a *ScaleAgent) startClusterAgentTunnel(clusterName, clusterID string) erro
 			ctx, cancel := context.WithCancel(a.ctx)
 			// Custom local dialer to rewrite Rancher's probe host to our local ping server
 			localDialer := func(dctx context.Context, network, address string) (net.Conn, error) {
-				// Rewrite the special probe host to loopback where our /ping server listens
-				if network == "tcp" && address == "not-used:80" {
-					address = "127.0.0.1:6080"
-				}
+				if network == "tcp" && address == "not-used:80" { address = "127.0.0.1:6080" }
 				var d net.Dialer
 				return d.DialContext(dctx, network, address)
 			}

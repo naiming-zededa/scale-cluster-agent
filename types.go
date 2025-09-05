@@ -24,6 +24,8 @@ type Config struct {
     MainClusterName string `json:"MainClusterName"`
     MainAPIPort     int    `json:"MainAPIPort"`   // secure or insecure port exposed by KWOK apiserver
     ProxyBasePort   int    `json:"ProxyBasePort"` // starting port for per-virtual-cluster proxies
+    // If true, apply cluster.yaml resources ONLY once into the main cluster, not per tenant namespace.
+    ResourceOnlyInMainCluster bool `json:"ResourceOnlyInMainCluster"`
 
     // Diagnostics/profiling
     PprofEnable        bool `json:"PprofEnable"`
